@@ -141,13 +141,40 @@ blocklist:
   symbols: []
 
 webhook:
-  # Off by default. Set url to Market Bot's webhook when that service exists.
+  # Off by default. URL may also be set with WEBHOOK_URL. The HMAC secret is
+  # WEBHOOK_SECRET in the environment and is never read from this file.
   enabled: false
   url: ""
   timeout_seconds: 5
-  max_retries: 3
+  max_retries: 5
+  retry_backoff_seconds: 1
+  retry_backoff_max_seconds: 60
   secret_env: WEBHOOK_SECRET
+  require_signature: true
+  signature_max_age_seconds: 300
   send_rejects: false
+
+# A reviewer must attach open or skip before this elapses. The timeout is
+# always skip, including when timeout_action is edited.
+decision:
+  timeout_seconds: 3600
+  timeout_action: skip
+
+# Empty listen leaves the review endpoint off. Bind loopback when you serve it.
+review:
+  listen: ""
+  secret_env: REVIEW_SECRET
+
+paper:
+  initial_equity: 800
+  clock_days: 14
+  # A closed 1H bar older than this blocks new entries.
+  max_data_age_seconds: 5400
+  kill_switch_path: data/KILL
+  loop_seconds: 60
+
+journal:
+  jsonl_path: data/journal.jsonl
 
 data:
   sqlite_path: data/desk.sqlite

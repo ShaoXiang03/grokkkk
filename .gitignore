@@ -13,6 +13,8 @@ config/secrets.env
 data/*.sqlite
 data/*.sqlite3
 data/*.db
+data/*.jsonl
+data/KILL
 reports/*
 !reports/backtest-*.md
 !reports/backtest-*.csv

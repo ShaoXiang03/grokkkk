@@ -335,20 +335,23 @@ def test_client_refuses_order_endpoints():
     assert all(path.startswith("/fapi/v1/") for path in ALLOWED_PATHS)
 
 
-def test_webhook_is_off_by_default_and_url_is_configurable():
+def test_webhook_is_off_by_default_and_url_is_configurable(monkeypatch):
     settings = load_settings(ROOT / "config" / "settings.yaml")
     assert settings["webhook"]["enabled"] is False
     assert settings["webhook"]["url"] == ""
+    assert settings["webhook"]["require_signature"] is True
     assert settings["mode"] == "paper"
     text = (ROOT / "config" / "settings.yaml").read_text().lower()
     assert "api_key" not in text
     assert "secret_key" not in text
+    assert "webhook_secret:" not in text
     captured = {}
 
     class Session:
         def post(self, url, data, headers, timeout):
             captured["url"] = url
             captured["data"] = data
+            captured["headers"] = dict(headers)
 
             class Response:
                 status_code = 200
@@ -362,9 +365,31 @@ def test_webhook_is_off_by_default_and_url_is_configurable():
     enabled = load_settings(
         overrides={"webhook": {"enabled": True, "url": "https://market-bot.example/hook", "max_retries": 1}}
     )
-    sent = send_packet({"status": "proposed", "signal_id": "abc"}, enabled, session=Session())
+    blocked = send_packet({"status": "proposed", "signal_id": "abc"}, enabled, session=Session())
+    assert blocked["sent"] is False
+    assert blocked["reason"] == "missing_secret"
+    assert "url" not in captured
+    monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+    stamped = 1_700_000_000_000
+    sent = send_packet(
+        {"status": "proposed", "signal_id": "abc"},
+        enabled,
+        session=Session(),
+        now_ms=stamped,
+    )
     assert sent["sent"] is True
     assert captured["url"] == "https://market-bot.example/hook"
+    assert captured["headers"]["Idempotency-Key"] == "abc"
+    from desk.delivery.signing import verify_signature
+
+    assert verify_signature(
+        captured["data"],
+        "test-secret",
+        captured["headers"]["X-Desk-Timestamp"],
+        captured["headers"]["X-Desk-Signature"],
+        now_ms=stamped,
+        max_age_ms=5_000,
+    )
 
 
 def test_vision_csv_parsers_and_month_span():

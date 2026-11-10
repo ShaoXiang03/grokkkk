@@ -252,6 +252,87 @@ def _risk_cap_gate(
     return _pass(f"{name} {total:.4f} within {cap:.4f}", ts, total_risk=total, cap=cap)
 
 
+def fresh_account_blocks(
+    packet: dict,
+    account: dict | None,
+    open_positions: list[dict],
+    settings: dict,
+    now_ms: int,
+) -> list[str]:
+    """Re-check vetoes and caps that can change after the packet was built.
+
+    The packet's stored gates are not rewritten here. A later master_decision
+    cannot clear a name this function returns. Setup-specific caps stay in this
+    module; delivery and the paper loop only consume the names.
+    """
+    blocks: list[str] = []
+    equity = _as_float(None if account is None else account.get("equity_usdt"))
+    risk = _as_float(packet.get("risk_usdt"))
+    news = None if account is None else account.get("news_status")
+    if news is None or str(news).upper() != "ALLOW":
+        blocks.append("news")
+    if equity is None or equity <= 0 or risk is None:
+        blocks.extend(["open_risk", "cluster"])
+    else:
+        opened = _risk_cap_gate(
+            "open risk",
+            equity,
+            open_positions,
+            risk,
+            float(settings["risk"]["max_open_risk_pct"]),
+            now_ms,
+            predicate=lambda p: True,
+        )
+        if opened["result"] != "pass":
+            blocks.append("open_risk")
+        this_key = packet.get("cluster_key")
+        cluster = _risk_cap_gate(
+            "cluster risk",
+            equity,
+            open_positions,
+            risk,
+            float(settings["risk"]["max_cluster_risk_pct"]),
+            now_ms,
+            predicate=lambda p: p.get("cluster_key") == this_key,
+        )
+        if cluster["result"] != "pass":
+            blocks.append("cluster")
+        if packet.get("setup") == SETUP_MEME:
+            capped = _risk_cap_gate(
+                "setup D risk",
+                equity,
+                open_positions,
+                risk,
+                float(settings["risk"]["max_setup_d_risk_pct"]),
+                now_ms,
+                predicate=lambda p: p.get("setup") == SETUP_MEME,
+            )
+            if capped["result"] != "pass":
+                blocks.append("setup_d_cap")
+    daily = _as_float(None if account is None else account.get("daily_pnl_pct"))
+    weekly = _as_float(None if account is None else account.get("weekly_pnl_pct"))
+    if daily is None or daily <= float(settings["risk"]["daily_loss_pause_pct"]):
+        blocks.append("daily_loss")
+    if weekly is None or weekly <= float(settings["risk"]["weekly_loss_pause_pct"]):
+        blocks.append("weekly_loss")
+    chain = (packet.get("hard_gates") or {}).get("on_chain")
+    if isinstance(chain, dict) and chain.get("result") != "pass":
+        blocks.append("on_chain")
+    return blocks
+
+
+def _as_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
 def all_passed(gates: dict[str, dict]) -> bool:
     return all(item.get("result") == "pass" for item in gates.values())
 

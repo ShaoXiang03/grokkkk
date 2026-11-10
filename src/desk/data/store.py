@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -90,6 +91,83 @@ CREATE TABLE IF NOT EXISTS vision_months (
     rows INTEGER NOT NULL,
     PRIMARY KEY (symbol, dataset, month)
 );
+CREATE TABLE IF NOT EXISTS webhook_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_ms INTEGER NOT NULL,
+    last_error TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    delivered_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS decision_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms INTEGER NOT NULL,
+    signal_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    market_context TEXT NOT NULL,
+    requested_decision TEXT NOT NULL,
+    effective_decision TEXT NOT NULL,
+    reasoning TEXT,
+    decision_ts TEXT,
+    override_refused INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_account (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    initial_equity REAL,
+    equity_usdt REAL,
+    day_start_equity REAL,
+    week_start_equity REAL,
+    day_key TEXT,
+    week_key TEXT,
+    as_of_ms INTEGER,
+    started_at_ms INTEGER,
+    last_block TEXT,
+    updated_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS paper_positions (
+    symbol TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    exit_ms INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_equity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms INTEGER NOT NULL,
+    equity REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_resolutions (
+    signal_id TEXT PRIMARY KEY,
+    outcome TEXT NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    detail TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_violations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms INTEGER NOT NULL,
+    class TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    signal_id TEXT,
+    detail TEXT NOT NULL
+);
 """
 
 
@@ -99,8 +177,10 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
 
     def close(self) -> None:
@@ -442,3 +522,280 @@ class Store:
             (ts_ms, kind, json.dumps(payload, default=str)),
         )
         self.conn.commit()
+
+    def get_signal(self, signal_id: str) -> dict | None:
+        row = self.conn.execute("SELECT payload FROM signals WHERE signal_id = ?", (signal_id,)).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload"])
+
+    def list_signal_packets(self, status: str | None = None) -> list[dict]:
+        if status is None:
+            rows = self.conn.execute("SELECT payload FROM signals ORDER BY ts_ms, signal_id")
+        else:
+            rows = self.conn.execute(
+                "SELECT payload FROM signals WHERE status = ? ORDER BY ts_ms, signal_id",
+                (status,),
+            )
+        return [json.loads(row["payload"]) for row in rows]
+
+    def outbox_by_key(self, idempotency_key: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM webhook_outbox WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def insert_outbox(self, row: dict) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO webhook_outbox (
+                signal_id, idempotency_key, body, status, attempts, next_attempt_ms,
+                last_error, created_ms, updated_ms, delivered_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["signal_id"],
+                row["idempotency_key"],
+                row["body"],
+                row["status"],
+                int(row["attempts"]),
+                int(row["next_attempt_ms"]),
+                row.get("last_error"),
+                int(row["created_ms"]),
+                int(row["updated_ms"]),
+                row.get("delivered_ms"),
+            ),
+        )
+        self.conn.commit()
+
+    def due_outbox(self, now_ms: int) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM webhook_outbox
+            WHERE status = 'pending' AND next_attempt_ms <= ?
+            ORDER BY id
+            """,
+            (int(now_ms),),
+        )
+        return [dict(row) for row in rows]
+
+    def update_outbox(self, idempotency_key: str, **fields) -> None:
+        allowed = {
+            "status",
+            "attempts",
+            "next_attempt_ms",
+            "last_error",
+            "updated_ms",
+            "delivered_ms",
+        }
+        keys = [key for key in fields if key in allowed]
+        if not keys:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in keys)
+        values = [fields[key] for key in keys]
+        values.append(idempotency_key)
+        self.conn.execute(
+            f"UPDATE webhook_outbox SET {assignments} WHERE idempotency_key = ?",
+            values,
+        )
+        self.conn.commit()
+
+    def append_decision_journal(self, ts_ms: int, signal_id: str, event: str, payload: dict) -> int:
+        """Append one journal row. Rows are never updated or deleted."""
+        cursor = self.conn.execute(
+            "INSERT INTO decision_journal (ts_ms, signal_id, event, payload) VALUES (?, ?, ?, ?)",
+            (int(ts_ms), signal_id, event, json.dumps(payload, sort_keys=True, default=str)),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def read_decision_journal(self, signal_id: str | None = None) -> list[dict]:
+        if signal_id is None:
+            rows = self.conn.execute("SELECT * FROM decision_journal ORDER BY id")
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM decision_journal WHERE signal_id = ? ORDER BY id",
+                (signal_id,),
+            )
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            out.append(item)
+        return out
+
+    def append_review(self, row: dict) -> int:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO reviews (
+                signal_id, ts_ms, market_context, requested_decision, effective_decision,
+                reasoning, decision_ts, override_refused, reason, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["signal_id"],
+                int(row["ts_ms"]),
+                json.dumps(row["market_context"], sort_keys=True, default=str),
+                row["requested_decision"],
+                row["effective_decision"],
+                row.get("reasoning"),
+                row.get("decision_ts"),
+                1 if row.get("override_refused") else 0,
+                row["reason"],
+                json.dumps(row, sort_keys=True, default=str),
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def latest_review(self, signal_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM reviews WHERE signal_id = ? ORDER BY id DESC LIMIT 1",
+            (signal_id,),
+        ).fetchone()
+        return _review_dict(row) if row else None
+
+    def list_reviews(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM reviews ORDER BY id")
+        return [_review_dict(row) for row in rows]
+
+    def paper_account(self) -> dict | None:
+        row = self.conn.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
+        return dict(row) if row else None
+
+    def save_paper_account(self, row: dict) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_account (
+                id, initial_equity, equity_usdt, day_start_equity, week_start_equity,
+                day_key, week_key, as_of_ms, started_at_ms, last_block, updated_ms
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                initial_equity=excluded.initial_equity,
+                equity_usdt=excluded.equity_usdt,
+                day_start_equity=excluded.day_start_equity,
+                week_start_equity=excluded.week_start_equity,
+                day_key=excluded.day_key,
+                week_key=excluded.week_key,
+                as_of_ms=excluded.as_of_ms,
+                started_at_ms=excluded.started_at_ms,
+                last_block=excluded.last_block,
+                updated_ms=excluded.updated_ms
+            """,
+            (
+                row.get("initial_equity"),
+                row.get("equity_usdt"),
+                row.get("day_start_equity"),
+                row.get("week_start_equity"),
+                row.get("day_key"),
+                row.get("week_key"),
+                row.get("as_of_ms"),
+                row.get("started_at_ms"),
+                row.get("last_block"),
+                int(row["updated_ms"]),
+            ),
+        )
+        self.conn.commit()
+
+    def save_paper_position(self, symbol: str, payload: str, updated_ms: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_positions (symbol, payload, updated_ms) VALUES (?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET payload=excluded.payload, updated_ms=excluded.updated_ms
+            """,
+            (symbol, payload, int(updated_ms)),
+        )
+        self.conn.commit()
+
+    def delete_paper_position(self, symbol: str) -> None:
+        self.conn.execute("DELETE FROM paper_positions WHERE symbol = ?", (symbol,))
+        self.conn.commit()
+
+    def paper_position_rows(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM paper_positions ORDER BY symbol")
+        return [dict(row) for row in rows]
+
+    def save_paper_trade(self, trade: dict) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_trades (signal_id, symbol, exit_ms, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                trade["signal_id"],
+                trade["symbol"],
+                int(trade["exit_time"]),
+                json.dumps(trade, sort_keys=True, default=str),
+            ),
+        )
+        self.conn.commit()
+
+    def list_paper_trades(self) -> list[dict]:
+        rows = self.conn.execute("SELECT payload FROM paper_trades ORDER BY id")
+        return [json.loads(row["payload"]) for row in rows]
+
+    def append_equity_point(self, ts_ms: int, equity: float) -> None:
+        self.conn.execute(
+            "INSERT INTO paper_equity (ts_ms, equity) VALUES (?, ?)",
+            (int(ts_ms), float(equity)),
+        )
+        self.conn.commit()
+
+    def equity_curve(self) -> list[tuple[int, float]]:
+        rows = self.conn.execute("SELECT ts_ms, equity FROM paper_equity ORDER BY id")
+        return [(int(row["ts_ms"]), float(row["equity"])) for row in rows]
+
+    def latest_equity_point(self) -> float | None:
+        row = self.conn.execute("SELECT equity FROM paper_equity ORDER BY id DESC LIMIT 1").fetchone()
+        return None if row is None else float(row["equity"])
+
+    def resolution(self, signal_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM paper_resolutions WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_resolution(self, signal_id: str, outcome: str, ts_ms: int, detail: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_resolutions (signal_id, outcome, ts_ms, detail)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                outcome=excluded.outcome,
+                ts_ms=excluded.ts_ms,
+                detail=excluded.detail
+            """,
+            (signal_id, outcome, int(ts_ms), detail),
+        )
+        self.conn.commit()
+
+    def append_paper_event(self, ts_ms: int, klass: str, kind: str, signal_id: str | None, detail: str) -> int:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO paper_violations (ts_ms, class, kind, signal_id, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (int(ts_ms), klass, kind, signal_id, detail),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def list_paper_events(self, klass: str | None = None) -> list[dict]:
+        if klass is None:
+            rows = self.conn.execute("SELECT * FROM paper_violations ORDER BY id")
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM paper_violations WHERE class = ? ORDER BY id",
+                (klass,),
+            )
+        return [dict(row) for row in rows]
+
+
+def _review_dict(row) -> dict:
+    item = dict(row)
+    item["market_context"] = json.loads(item["market_context"])
+    item["override_refused"] = bool(item["override_refused"])
+    item["payload"] = json.loads(item["payload"])
+    return item

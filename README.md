@@ -11,15 +11,19 @@ The working partial is **50% at 2R**. `exits.partial_at_r` can be set to `1.0` t
 | Path | Role |
 | --- | --- |
 | `config/settings.yaml` | Thresholds, indicator settings, risk caps, webhook URL. No secrets. |
-| `config/secrets.env.example` | Optional `WEBHOOK_SECRET`. Copy it on the server; do not commit the copy. |
-| `src/desk/data/` | Public REST client and SQLite cache (klines, funding, exchangeInfo, signals). |
+| `config/secrets.env.example` | `WEBHOOK_URL`, `WEBHOOK_SECRET`, `REVIEW_SECRET`. Copy it on the server; do not commit the copy. |
+| `src/desk/data/` | Public REST client and SQLite cache (klines, funding, exchangeInfo, signals, outbox, journal). |
 | `src/desk/indicators/` | Bollinger (20, 2), EMA 20/50/200, RSI 14, ATR 14 Wilder, volume SMA, bandwidth. |
 | `src/desk/rules/` | Universe filters, BTC regime, setups A–D, sizing, exits, hard gates, on-chain checks. |
-| `src/desk/scanner/` | Closed-bar evaluation, v0.3 packet, webhook sender (off by default). |
+| `src/desk/scanner/` | Closed-bar evaluation and the v0.3 packet. It does not name a broker. |
+| `src/desk/delivery/` | HMAC webhook, durable outbox, reviewer decision. Setup-agnostic. |
+| `src/desk/journal/` | Append-only decision journal and the Portfolio Journal export. |
+| `src/desk/paper/` | Simulated fills, kill switch, 14-day clock, scorecard. No order client. |
 | `src/desk/backtest/` | Same evaluation path, costs, metrics, walk-forward split. |
-| `scripts/` | `backfill.py`, `run_scanner.py`, `run_backtest.py`. |
+| `docs/deploy.md` | systemd, env file, log rotation. |
+| `scripts/` | Backfill, scanner, backtest, paper, review, export, outbox drain. |
 
-`src/desk/execution/` is intentionally absent. Order placement, the kill switch, and paper fills belong to later milestones.
+`src/desk/execution/` is absent on purpose. There is no order placement. A new setup becomes eligible by emitting a packet whose hard gates pass; the webhook, journal, and paper loop do not need a code change for that.
 
 ## Setup
 
@@ -72,15 +76,15 @@ On each run it evaluates the latest **closed** 1H bar. A 4H setup is remembered 
 
 The packet is the scanner's own pass/fail. With the committed config, `account.news_status` is null, so the news gate **fails closed** and packets are `rejected`. For a local paper dry run, set `account.news_status: ALLOW` and keep `mode: paper`. That is an assumption, not a News Watcher connection. Missing equity, missing funding, or an unreadable blocklist also fail closed.
 
-Webhook delivery stays off until both of these are set:
+Webhook delivery stays off until it is enabled and both the URL and `WEBHOOK_SECRET` are set. The URL may be `webhook.url` or the `WEBHOOK_URL` environment variable. The secret is only the environment variable. A missing secret does not post and does not drop the packet: the body stays in `webhook_outbox` until a later `scripts/drain_outbox.py` or paper cycle can sign it.
 
 ```yaml
 webhook:
   enabled: true
-  url: "https://example.invalid/market-bot/webhook"  # Market Bot's URL, when it exists
+  url: "https://example.invalid/market-bot/webhook"  # or set WEBHOOK_URL
 ```
 
-If `WEBHOOK_SECRET` is set in the environment, the body is HMAC-SHA256 in `X-Desk-Signature`. Rejected packets are not posted unless `webhook.send_rejects` is true. The same symbol + setup + direction + 4H setup bar is not emitted twice. A hard-stop exit recorded in the store blocks that symbol for 7 days.
+The signature is hex HMAC-SHA256 of `{X-Desk-Timestamp}.{raw body}`. `Idempotency-Key` is the signal id and is stable across retries. Backoff is stored on the outbox row. HTTP 4xx (other than 409 and 429) dead-letters the row and keeps the body. 409 counts as already delivered. Rejected packets are not posted unless `webhook.send_rejects` is true. The same symbol + setup + direction + 4H setup bar is not emitted twice. A hard-stop exit recorded in the store blocks that symbol for 7 days.
 
 ### Signal schema (v0.3 plus the Market Bot change)
 
@@ -90,6 +94,15 @@ Market Bot does **not** vote. `votes` contains only `scanner` (`pass` or `fail`)
 * `master_decision`: `{decision: open|skip|null, reasoning, ts}`
 
 The scanner never fills those. `decision_path` is `pending_master` when every scanner gate passes, otherwise `hard_gate_reject`. `margin_mode` is always `isolated`. `tp2` is null.
+
+A reviewer fills them later, by id:
+
+```bash
+python3 scripts/attach_decision.py --signal-id SIGNAL_ID --decision skip --reasoning "no room" --summary "range intact"
+python3 scripts/serve_review.py --listen 127.0.0.1:8787
+```
+
+`POST /signals/<id>/review` requires the same HMAC scheme, using `REVIEW_SECRET` (or `WEBHOOK_SECRET` if that is unset). `open` is stored as `skip` when any hard gate is not pass, when reasoning is blank, when equity cannot be read, or when the signal was already rejected. `market_context.onchain_checks` is recorded and does not replace `hard_gates.on_chain`. A second decision for the same id is refused. If nobody decides before `decision.timeout_seconds` (default 3600, measured from the signal bar's close), the signal is skip. An `open` that arrives after that window is also skip. `timeout_action` cannot be set to open.
 
 Setup D on-chain checks live on the scanner gate `hard_gates.on_chain.checks`, each `PASS`, `FAIL`, or `MISSING`:
 
@@ -133,14 +146,26 @@ It writes `reports/backtest-YYYYMMDD.md` and matching CSVs. A variant becomes th
 
 ## Tests
 
-`pytest` covers indicator values, setup conditions on synthetic bars, the worked sizing example (equity 800, entry 2.00, stop 1.90, size 160), liquidation and notional caps, trail stops that cannot widen, on-chain fail-closed behavior, the signal schema, webhook URL configuration, incremental SQLite writes, the public-endpoint allow-list, a no-lookahead check, and a synthetic replay that pays fees. A passing test is not evidence of an edge.
+`pytest` covers indicator values, setup conditions on synthetic bars, the worked sizing example (equity 800, entry 2.00, stop 1.90, size 160), liquidation and notional caps, trail stops that cannot widen, on-chain fail-closed behavior, the signal schema, webhook signatures and the outbox, reviewer decisions that cannot override a gate, the append-only journal export, paper fills using the backtest cost model, and the stale-data, equity, kill-switch, and timeout fail-closed paths. A passing test is not evidence of an edge.
 
-## What M4+ still needs
+## Paper loop
+
+```bash
+python3 scripts/run_paper.py --once --refresh --symbols BTCUSDT ETHUSDT
+python3 scripts/run_paper.py --report
+python3 scripts/export_journal.py --csv reports/portfolio-journal.csv --json reports/portfolio-journal.json
+```
+
+The loop evaluates closed bars, enqueues proposed packets, and simulates a fill only after an effective `open`. Fills use the backtester's taker fee, half-spread plus slippage, and funding. The hard stop is never widened. If slippage crosses the stop, the entry is cancelled. Open risk is checked again at fill time against the paper book. `data/KILL` (or `KILL_SWITCH_PATH`) blocks new entries. A stale closed 1h bar, or an equity figure the ledger cannot compute, blocks new entries. The scorecard reports the 14-day Asia/Kuala_Lumpur clock, trades, win rate, expectancy R, max drawdown, rule-violation count, and reviewer opens versus skips.
+
+Paper equity is the local ledger, starting at `paper.initial_equity`. This process cannot read exchange equity. There is no account endpoint and no API key. `docs/deploy.md` is the server runbook.
+
+The committed `account.news_status` is null, so an `open` is refused until you set `ALLOW` yourself. Setup D stays refused while its on-chain checks are `MISSING`.
+
+## What is still not in this repo
 
 Do not point this process at a live account.
 
-* **M4 — bot pipeline.** Signed webhook to Market Bot, which fills `market_context` (it still does not vote). Strategy and News Watcher remain hard gates. Master writes `master_decision.decision` as `open` or `skip` plus reasoning. The journal stores that reasoning. The server must refuse an order when reasoning is missing on a decision that required Master.
-* **M5 — paper.** Simulated fills on live public prices for the 14-day Asia/Kuala_Lumpur clock, and a separate testnet check that an isolated order and its hard stop are accepted together. Kill-switch file. Risk gates re-read real equity; if equity or P&L cannot be read, new entries fail closed. If the stop cannot be placed, the entry is cancelled. No withdrawal permission on any key.
-* **M6 — first live, only if Shaoxiang turns it on.** Trade-only key, withdrawals disabled, IP-restricted to the Alibaba server, secret stored in `config/secrets.env` on that server and nowhere else. Risk scale 0.5. Go-live checks come from the journal, not from P&L. This repository should still not contain the key.
+* **M6 — first live, only if Shaoxiang turns it on.** Trade-only key, withdrawals disabled, IP-restricted to the server, secret stored in the env file on that server and nowhere else. Risk scale 0.5. Go-live checks come from the journal, not from P&L. This repository should still not contain the key. A testnet check that an isolated order and its hard stop are accepted together is an order path, so it is not implemented here.
 
 Also still open for a faithful backtest: historical predicted funding, historical books, News Watcher history, and an on-chain source for Setup D. The Vision path reduces survivorship bias only for contracts the archive still hosts. Lot size and tick size filters matter before any order path exists. The liquidation price here is the simplified isolated formula, not Binance's tiered cumulative maintenance table.

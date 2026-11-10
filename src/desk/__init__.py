@@ -1,3 +1,3 @@
 """Chart Analyst scanner and backtester. Public data only; no order placement."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
