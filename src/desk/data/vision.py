@@ -36,6 +36,15 @@ def funding_url(symbol: str, month: str) -> str:
     return f"{VISION}/fundingRate/{symbol}/{symbol}-fundingRate-{month}.zip"
 
 
+def premium_url(symbol: str, interval: str, month: str) -> str:
+    return f"{VISION}/premiumIndexKlines/{symbol}/{interval}/{symbol}-{interval}-{month}.zip"
+
+
+def metrics_url(symbol: str, day: str) -> str:
+    """Daily 5-minute metrics file. `day` is YYYY-MM-DD."""
+    return f"https://data.binance.vision/data/futures/um/daily/metrics/{symbol}/{symbol}-metrics-{day}.zip"
+
+
 def parse_kline_csv(text: str) -> list[dict]:
     rows = []
     for line in text.splitlines():
@@ -70,8 +79,20 @@ def parse_funding_csv(text: str) -> list[dict]:
         if not parts[0].lstrip("-").isdigit():
             continue
         # Vision files are calc_time, funding_interval_hours, last_funding_rate.
-        rate = float(parts[2] if len(parts) > 2 else parts[1])
-        rows.append({"funding_time": int(float(parts[0])), "funding_rate": rate})
+        # Older two-column files are fundingTime, fundingRate. Missing interval is 8h.
+        if len(parts) > 2:
+            interval = float(parts[1])
+            rate = float(parts[2])
+        else:
+            interval = 8.0
+            rate = float(parts[1])
+        rows.append(
+            {
+                "funding_time": int(float(parts[0])),
+                "funding_rate": rate,
+                "interval_hours": interval,
+            }
+        )
     return rows
 
 
@@ -153,6 +174,10 @@ def cache_file(cache_dir, kind: str, symbol: str, month: str, interval: str | No
     root = Path(cache_dir)
     if kind == "funding":
         return root / "funding" / symbol / f"{month}.zip"
+    if kind == "premium":
+        if not interval:
+            raise ValueError("interval is required for premium cache files")
+        return root / "premium" / symbol / interval / f"{month}.zip"
     if not interval:
         raise ValueError("interval is required for kline cache files")
     return root / "klines" / symbol / interval / f"{month}.zip"
@@ -199,3 +224,88 @@ def load_funding_month_cached(session, cache_dir, symbol: str, month: str, timeo
     except (zipfile.BadZipFile, IndexError, UnicodeDecodeError, ValueError):
         path.unlink(missing_ok=True)
         raise
+
+
+def load_premium_month_cached(session, cache_dir, symbol: str, interval: str, month: str, timeout: float) -> list[dict] | None:
+    path = cache_file(cache_dir, "premium", symbol, month, interval)
+    payload = load_cached_zip(session, premium_url(symbol, interval, month), path, timeout)
+    if payload is None:
+        return None
+    try:
+        return parse_kline_csv(_zip_text(payload))
+    except (zipfile.BadZipFile, IndexError, UnicodeDecodeError, ValueError):
+        path.unlink(missing_ok=True)
+        raise
+
+
+def parse_metric_time(text: str) -> int:
+    """Vision metrics use 'YYYY-MM-DD HH:MM:SS' or a millisecond timestamp."""
+    raw = text.strip()
+    numeric = raw.replace(".", "", 1)
+    if numeric.isdigit():
+        value = int(float(raw))
+        if value < 10_000_000_000:
+            value *= 1000
+        return value
+    parsed = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def _metric_float(text: str) -> float | None:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value != value:  # NaN
+        return None
+    return value
+
+
+def parse_metrics_csv(text: str) -> list[dict]:
+    """Deduplicate by create_time and keep the last complete observation.
+
+    A row is complete when both open-interest columns parse. An incomplete
+    duplicate does not replace a complete one at the same timestamp.
+    """
+    order: list[int] = []
+    by_time: dict[int, dict] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("create_time"):
+            continue
+        parts = line.split(",")
+        if len(parts) < 4:
+            continue
+        try:
+            created = parse_metric_time(parts[0])
+        except (ValueError, IndexError):
+            continue
+        oi = _metric_float(parts[2])
+        oi_value = _metric_float(parts[3])
+        if oi is None or oi_value is None:
+            continue
+        if created not in by_time:
+            order.append(created)
+        by_time[created] = {
+            "create_time": created,
+            "sum_open_interest": oi,
+            "sum_open_interest_value": oi_value,
+            "count_long_short_ratio": _metric_float(parts[6]) if len(parts) > 6 else None,
+            "sum_taker_long_short_vol_ratio": _metric_float(parts[7]) if len(parts) > 7 else None,
+        }
+    return [by_time[stamp] for stamp in order]
+
+
+def metrics_last_snapshot(rows: list[dict]) -> dict | None:
+    """Last complete snapshot in a daily file, with the UTC day floored."""
+    if not rows:
+        return None
+    last = rows[-1]
+    for row in rows:
+        if row["create_time"] >= last["create_time"]:
+            last = row
+    day_ms = last["create_time"] - (last["create_time"] % 86_400_000)
+    return {**last, "day_ms": day_ms}

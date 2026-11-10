@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS funding (
     symbol TEXT NOT NULL,
     funding_time INTEGER NOT NULL,
     funding_rate REAL NOT NULL,
+    interval_hours REAL,
     PRIMARY KEY (symbol, funding_time)
 );
 CREATE TABLE IF NOT EXISTS funding_snapshot (
@@ -90,6 +91,23 @@ CREATE TABLE IF NOT EXISTS vision_months (
     month TEXT NOT NULL,
     rows INTEGER NOT NULL,
     PRIMARY KEY (symbol, dataset, month)
+);
+CREATE TABLE IF NOT EXISTS vision_days (
+    symbol TEXT NOT NULL,
+    dataset TEXT NOT NULL,
+    day TEXT NOT NULL,
+    rows INTEGER NOT NULL,
+    PRIMARY KEY (symbol, dataset, day)
+);
+CREATE TABLE IF NOT EXISTS metrics_daily (
+    symbol TEXT NOT NULL,
+    day_ms INTEGER NOT NULL,
+    create_time INTEGER NOT NULL,
+    sum_open_interest REAL,
+    sum_open_interest_value REAL,
+    count_long_short_ratio REAL,
+    sum_taker_long_short_vol_ratio REAL,
+    PRIMARY KEY (symbol, day_ms)
 );
 CREATE TABLE IF NOT EXISTS webhook_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,9 +200,16 @@ class Store:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        self._ensure_funding_interval()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _ensure_funding_interval(self) -> None:
+        columns = [row[1] for row in self.conn.execute("PRAGMA table_info(funding)")]
+        if "interval_hours" not in columns:
+            self.conn.execute("ALTER TABLE funding ADD COLUMN interval_hours REAL")
+            self.conn.commit()
 
     def upsert_symbols(self, rows: list[dict], updated_at_ms: int) -> None:
         self.conn.executemany(
@@ -296,10 +321,20 @@ class Store:
     def upsert_funding(self, symbol: str, rows: list[dict]) -> None:
         self.conn.executemany(
             """
-            INSERT INTO funding (symbol, funding_time, funding_rate) VALUES (?, ?, ?)
-            ON CONFLICT(symbol, funding_time) DO UPDATE SET funding_rate=excluded.funding_rate
+            INSERT INTO funding (symbol, funding_time, funding_rate, interval_hours) VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol, funding_time) DO UPDATE SET
+                funding_rate=excluded.funding_rate,
+                interval_hours=COALESCE(excluded.interval_hours, funding.interval_hours)
             """,
-            [(symbol, int(row["funding_time"]), float(row["funding_rate"])) for row in rows],
+            [
+                (
+                    symbol,
+                    int(row["funding_time"]),
+                    float(row["funding_rate"]),
+                    row.get("interval_hours"),
+                )
+                for row in rows
+            ],
         )
         self.conn.commit()
 
@@ -483,10 +518,20 @@ class Store:
         if rows:
             self.conn.executemany(
                 """
-                INSERT INTO funding (symbol, funding_time, funding_rate) VALUES (?, ?, ?)
-                ON CONFLICT(symbol, funding_time) DO UPDATE SET funding_rate=excluded.funding_rate
+                INSERT INTO funding (symbol, funding_time, funding_rate, interval_hours) VALUES (?, ?, ?, ?)
+                ON CONFLICT(symbol, funding_time) DO UPDATE SET
+                    funding_rate=excluded.funding_rate,
+                    interval_hours=COALESCE(excluded.interval_hours, funding.interval_hours)
                 """,
-                [(symbol, int(row["funding_time"]), float(row["funding_rate"])) for row in rows],
+                [
+                    (
+                        symbol,
+                        int(row["funding_time"]),
+                        float(row["funding_rate"]),
+                        row.get("interval_hours"),
+                    )
+                    for row in rows
+                ],
             )
         self.conn.execute(
             """
@@ -508,6 +553,121 @@ class Store:
             """
         )
         return [dict(row) for row in rows]
+
+    def load_interval_frame(self, interval: str) -> pd.DataFrame:
+        return pd.read_sql_query(
+            """
+            SELECT symbol, open_time, open, high, low, close, quote_volume
+            FROM klines WHERE interval = ?
+            """,
+            self.conn,
+            params=[interval],
+        )
+
+    def load_funding_frame(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT symbol, funding_time, funding_rate, interval_hours FROM funding",
+            self.conn,
+        )
+
+    def load_metrics_frame(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            """
+            SELECT symbol, day_ms, create_time, sum_open_interest, sum_open_interest_value
+            FROM metrics_daily
+            """,
+            self.conn,
+        )
+
+    def upsert_metrics_daily(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO metrics_daily (
+                symbol, day_ms, create_time, sum_open_interest, sum_open_interest_value,
+                count_long_short_ratio, sum_taker_long_short_vol_ratio
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, day_ms) DO UPDATE SET
+                create_time=excluded.create_time,
+                sum_open_interest=excluded.sum_open_interest,
+                sum_open_interest_value=excluded.sum_open_interest_value,
+                count_long_short_ratio=excluded.count_long_short_ratio,
+                sum_taker_long_short_vol_ratio=excluded.sum_taker_long_short_vol_ratio
+            """,
+            [
+                (
+                    row["symbol"],
+                    int(row["day_ms"]),
+                    int(row["create_time"]),
+                    row.get("sum_open_interest"),
+                    row.get("sum_open_interest_value"),
+                    row.get("count_long_short_ratio"),
+                    row.get("sum_taker_long_short_vol_ratio"),
+                )
+                for row in rows
+            ],
+        )
+        self.conn.commit()
+
+    def vision_day_done(self, symbol: str, dataset: str) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT day FROM vision_days WHERE symbol = ? AND dataset = ?",
+            (symbol, dataset),
+        )
+        return {row["day"] for row in rows}
+
+    def write_metrics_batch(self, metric_rows: list[dict], day_marks: list[tuple]) -> None:
+        """Insert daily metrics and resume markers in one transaction.
+
+        `day_marks` is (symbol, dataset, day, rows).
+        """
+        if metric_rows:
+            self.conn.executemany(
+                """
+                INSERT INTO metrics_daily (
+                    symbol, day_ms, create_time, sum_open_interest, sum_open_interest_value,
+                    count_long_short_ratio, sum_taker_long_short_vol_ratio
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, day_ms) DO UPDATE SET
+                    create_time=excluded.create_time,
+                    sum_open_interest=excluded.sum_open_interest,
+                    sum_open_interest_value=excluded.sum_open_interest_value,
+                    count_long_short_ratio=excluded.count_long_short_ratio,
+                    sum_taker_long_short_vol_ratio=excluded.sum_taker_long_short_vol_ratio
+                """,
+                [
+                    (
+                        row["symbol"],
+                        int(row["day_ms"]),
+                        int(row["create_time"]),
+                        row.get("sum_open_interest"),
+                        row.get("sum_open_interest_value"),
+                        row.get("count_long_short_ratio"),
+                        row.get("sum_taker_long_short_vol_ratio"),
+                    )
+                    for row in metric_rows
+                ],
+            )
+        if day_marks:
+            self.conn.executemany(
+                """
+                INSERT INTO vision_days (symbol, dataset, day, rows) VALUES (?, ?, ?, ?)
+                ON CONFLICT(symbol, dataset, day) DO UPDATE SET rows=excluded.rows
+                """,
+                day_marks,
+            )
+        self.conn.commit()
+
+    def mark_vision_day(self, symbol: str, dataset: str, day: str, nrows: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO vision_days (symbol, dataset, day, rows) VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol, dataset, day) DO UPDATE SET rows=excluded.rows
+            """,
+            (symbol, dataset, day, int(nrows)),
+        )
+        self.conn.commit()
 
     def symbols_with_interval(self, interval: str) -> list[str]:
         rows = self.conn.execute(

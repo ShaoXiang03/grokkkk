@@ -1,0 +1,7 @@
+strategy,enabled
+e1_cs_momentum,false
+e2_residual_momentum,true
+e3_slow_trend,true
+e4_funding_carry,false
+e5_positioning_trend,false
+e6_liquidation_proxy,true

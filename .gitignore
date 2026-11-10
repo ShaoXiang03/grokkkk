@@ -12,12 +12,16 @@ build/
 config/secrets.env
 data/*.sqlite
 data/*.sqlite3
+data/*.sqlite-shm
+data/*.sqlite-wal
 data/*.db
 data/*.jsonl
 data/KILL
 reports/*
 !reports/backtest-*.md
 !reports/backtest-*.csv
+!reports/strategies-*.md
+!reports/strategies-*.csv
 data/vision-cache/
 data/research-cache.pkl
 data/research-parts/

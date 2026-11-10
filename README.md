@@ -128,7 +128,18 @@ Costs in every trade: 0.05% taker fee per side, half the spread plus `costs.slip
 
 The report, written to `reports/backtest.json`, has per-setup and overall trade count, win rate, average R, expectancy (mean R), max drawdown, and Sharpe (daily returns, sample standard deviation, √365). Walk-forward uses a 182-day in-sample window and a 91-day out-of-sample window with **frozen** parameters. If the sample is shorter than one full pair of windows, out-of-sample metrics are null and the report says so. Quote out-of-sample only after a sample actually covers a fold. Nothing here is a performance target.
 
-The exit study compares the v0.3 4H trail with later arms, chandelier trails, and a 3-bar structure trail, at a 1R partial and a 2R partial. Setup B variants each change one filter (EMA separation, the caution regime, a 3-bar initial stop, or an EMA20 tag). The hard stop is never widened. Run it after the archive backfill:
+The exit study compares the v0.3 4H trail with later arms, chandelier trails, and a 3-bar structure trail, at a 1R partial and a 2R partial. Setup B variants each change one filter (EMA separation, the caution regime, a 3-bar initial stop, or an EMA20 tag). The hard stop is never widened.
+
+Strategy books E1–E6 live in `desk.strategies` and are not part of the 4h scanner. They read the same public archive (daily klines, funding, premium index, and the daily open-interest snapshot) and refuse `mode: live`. A book stays `enabled: false` unless its frozen hold-out, 2025-01 through 2026-10, finished above the start after fees, slippage, and funding.
+
+```bash
+python3 scripts/backfill_research.py --workers 16
+python3 scripts/run_strategies.py
+```
+
+The report is `reports/strategies-YYYYMMDD.md`. Nothing in that path places an order.
+
+Run the exit study after the archive backfill:
 
 ```bash
 python3 scripts/run_research.py --workers 3
