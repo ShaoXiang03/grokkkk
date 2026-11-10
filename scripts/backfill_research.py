@@ -20,6 +20,7 @@ from desk.data.backfill_research import (  # noqa: E402
     backfill_funding_and_premium,
     backfill_metrics,
     candidate_symbols,
+    targeted_metric_days,
 )
 from desk.data.store import Store  # noqa: E402
 from desk.strategies import require_research_mode  # noqa: E402
@@ -32,6 +33,12 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--skip-metrics", action="store_true")
     parser.add_argument("--metrics-only", action="store_true")
+    parser.add_argument(
+        "--metrics-top",
+        type=int,
+        default=80,
+        help="Download open interest for the point-in-time top N by 30-day quote volume (0 = every candidate day)",
+    )
     args = parser.parse_args()
     settings = load_settings(args.settings)
     require_research_mode(settings)
@@ -51,7 +58,12 @@ def main() -> None:
             workers=max(1, args.workers),
         )
     if not args.skip_metrics:
-        backfill_metrics(store, symbols, timeout=timeout, workers=max(1, args.workers))
+        plan = None
+        if args.metrics_top > 0:
+            print(f"building point-in-time top-{args.metrics_top} metrics plan", flush=True)
+            plan = targeted_metric_days(store, top_n=args.metrics_top)
+            print(f"metrics plan symbols={len(plan)} days={sum(len(days) for days in plan.values())}", flush=True)
+        backfill_metrics(store, symbols, timeout=timeout, workers=max(1, args.workers), plan=plan)
     print(f"non-trading rows={store.count_non_trading()}", flush=True)
     store.close()
     print(f"done in {time.time():.0f}", flush=True)

@@ -169,13 +169,74 @@ def _symbol_days(store: Store, symbol: str) -> list[str]:
     return days
 
 
-def backfill_metrics(store: Store, symbols: list[str], *, timeout: float, workers: int) -> None:
-    """Download daily metrics and store the last complete snapshot of each day."""
-    plans = []
-    for symbol in symbols:
+def targeted_metric_days(
+    store: Store,
+    *,
+    top_n: int = 80,
+    min_avg_quote: float = 10_000_000.0,
+    start: str = "2020-09-01",
+    end: str = "2026-11-01",
+) -> dict[str, list[str]]:
+    """Days to fetch: the point-in-time top N by 30-day quote volume, plus BTC and ETH.
+
+    The books only hold the top 40. The extra names are the buffer for the
+    open-interest floor, which can drop a liquid name and let the next one in.
+    A name outside this set cannot enter the book on that day.
+    """
+    frame = store.load_interval_frame("1d")
+    if frame.empty:
+        return {}
+    frame["day"] = (frame["open_time"].astype("int64") // DAY_MS) * DAY_MS
+    series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for symbol, group in frame.groupby("symbol", sort=False):
+        group = group.sort_values("day")
+        series[str(symbol)] = (
+            group["day"].to_numpy(np.int64),
+            np.nan_to_num(group["quote_volume"].to_numpy(dtype=float), nan=0.0),
+        )
+    start_ms = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    end_ms = int(datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    plan: dict[str, list[str]] = {}
+    day = start_ms
+    while day < end_ms:
+        scores: list[tuple[float, str]] = []
+        for symbol, (idx, volume) in series.items():
+            pos = int(np.searchsorted(idx, day))
+            if pos >= len(idx) or int(idx[pos]) != day:
+                continue
+            left = int(np.searchsorted(idx, day - 29 * DAY_MS))
+            avg = float(volume[left : pos + 1].sum()) / 30.0
+            if avg >= min_avg_quote or symbol in ("BTCUSDT", "ETHUSDT"):
+                scores.append((avg, symbol))
+        scores.sort(reverse=True)
+        picked = [symbol for _avg, symbol in scores[: int(top_n)]]
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            if symbol not in picked and any(name == symbol for _avg, name in scores):
+                picked.append(symbol)
+        label = datetime.fromtimestamp(day / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        for symbol in picked:
+            plan.setdefault(symbol, []).append(label)
+        day += DAY_MS
+    # Drop days already stored so a restart continues.
+    trimmed: dict[str, list[str]] = {}
+    for symbol, days in plan.items():
         done = store.vision_day_done(symbol, "metrics")
-        days = [day for day in _symbol_days(store, symbol) if day not in done]
-        plans.append((symbol, days))
+        left = [day for day in days if day not in done]
+        if left:
+            trimmed[symbol] = left
+    return trimmed
+
+
+def backfill_metrics(store: Store, symbols: list[str], *, timeout: float, workers: int, plan: dict[str, list[str]] | None = None) -> None:
+    """Download daily metrics and store the last complete snapshot of each day."""
+    if plan is None:
+        plans = []
+        for symbol in symbols:
+            done = store.vision_day_done(symbol, "metrics")
+            days = [day for day in _symbol_days(store, symbol) if day not in done]
+            plans.append((symbol, days))
+    else:
+        plans = [(symbol, days) for symbol, days in plan.items() if days]
 
     def one(symbol: str, days: list[str]) -> tuple[str, list[dict], list[tuple]]:
         session = make_session()
@@ -212,5 +273,5 @@ def backfill_metrics(store: Store, symbols: list[str], *, timeout: float, worker
             symbol, metrics, marks = future.result()
             store.write_metrics_batch(metrics, marks)
             finished += 1
-            if finished % 10 == 0 or finished == len(symbols):
-                print(f"metrics {finished}/{len(symbols)} last={symbol} days={len(marks)}", flush=True)
+            if finished % 10 == 0 or finished == len(plans):
+                print(f"metrics {finished}/{len(plans)} last={symbol} days={len(marks)}", flush=True)

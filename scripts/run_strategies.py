@@ -403,7 +403,7 @@ def main() -> None:
         "- Delisted versus still listed is inferred from the last Vision daily bar. A name that died in the last three days of the archive can be labelled TRADING. The backtest itself uses whether a bar exists on the decision day."
     )
     lines.append(
-        "- Metrics start in September 2020. Before that, the OI floor is not applied. E5 and E6 need OI or a year of funding z-scores, so they sit flat until the inputs exist."
+        "- Metrics start in September 2020. Before that, the OI floor is not applied. The archive pull keeps the last daily snapshot for the point-in-time top 80 names by 30-day quote volume, plus BTC and ETH. That covers the top-40 book and a buffer for names the $5m OI floor can drop. E5 and E6 sit flat until funding z-scores and OI exist."
     )
     lines.append(
         "- Funding notional uses that day's daily close as the mark for the 08:00 and 16:00 prints. The rate is the archived settlement. The mark is not a signal."
