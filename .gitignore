@@ -13,6 +13,11 @@ config/secrets.env
 data/*.sqlite
 data/*.sqlite3
 data/*.db
-reports/
+reports/*
+!reports/backtest-*.md
+!reports/backtest-*.csv
+data/vision-cache/
+data/research-cache.pkl
+data/research-parts/
 *.log
 .DS_Store

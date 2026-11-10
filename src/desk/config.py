@@ -71,6 +71,11 @@ def default_settings() -> dict[str, Any]:
                 "min_daily_bars": 200,
                 "risk_pct": 0.02,
                 "max_leverage": 3,
+                # Research switches. Defaults reproduce v0.3. See reports/ for the test.
+                "min_ema_gap_atr": 0.0,
+                "allow_caution": True,
+                "stop_swing_bars": 1,
+                "require_fast_ema_tag": False,
             },
             "range_reclaim": {
                 "enabled": True,
@@ -107,8 +112,13 @@ def default_settings() -> dict[str, Any]:
         "exits": {
             "partial_at_r": 2.0,
             "partial_fraction": 0.5,
+            "trail_mode": "ema",
+            "trail_arm": "immediate",
             "trail_ema_atr_mult": 0.25,
             "trail_close_atr_mult": 1.5,
+            "chandelier_atr_mult": 2.0,
+            "structure_lookback": 3,
+            "structure_atr_buffer": 0.25,
         },
         "risk": {
             "scale": 1.0,

@@ -83,6 +83,13 @@ CREATE TABLE IF NOT EXISTS journal (
     kind TEXT NOT NULL,
     payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS vision_months (
+    symbol TEXT NOT NULL,
+    dataset TEXT NOT NULL,
+    month TEXT NOT NULL,
+    rows INTEGER NOT NULL,
+    PRIMARY KEY (symbol, dataset, month)
+);
 """
 
 
@@ -90,9 +97,10 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
 
     def close(self) -> None:
@@ -324,6 +332,109 @@ class Store:
             (symbol, reason, 1 if active else 0),
         )
         self.conn.commit()
+
+    def vision_month_rows(self, symbol: str, dataset: str, month: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT rows FROM vision_months WHERE symbol = ? AND dataset = ? AND month = ?",
+            (symbol, dataset, month),
+        ).fetchone()
+        return None if row is None else int(row["rows"])
+
+    def vision_months_for(self, symbol: str, dataset: str) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT month, rows FROM vision_months WHERE symbol = ? AND dataset = ?",
+            (symbol, dataset),
+        )
+        return {row["month"]: int(row["rows"]) for row in rows}
+
+    def mark_vision_month(self, symbol: str, dataset: str, month: str, nrows: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO vision_months (symbol, dataset, month, rows) VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol, dataset, month) DO UPDATE SET rows=excluded.rows
+            """,
+            (symbol, dataset, month, int(nrows)),
+        )
+        self.conn.commit()
+
+    def write_vision_klines(self, symbol: str, interval: str, month: str, rows: list[dict]) -> None:
+        """Insert one cached month and its ledger row in a single commit."""
+        if rows:
+            self.conn.executemany(
+                """
+                INSERT INTO klines (
+                    symbol, interval, open_time, close_time, open, high, low, close, volume, quote_volume
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+                    close_time=excluded.close_time,
+                    open=excluded.open,
+                    high=excluded.high,
+                    low=excluded.low,
+                    close=excluded.close,
+                    volume=excluded.volume,
+                    quote_volume=excluded.quote_volume
+                """,
+                [
+                    (
+                        symbol,
+                        interval,
+                        int(row["open_time"]),
+                        int(row["close_time"]),
+                        row["open"],
+                        row["high"],
+                        row["low"],
+                        row["close"],
+                        row["volume"],
+                        row["quote_volume"],
+                    )
+                    for row in rows
+                ],
+            )
+        self.conn.execute(
+            """
+            INSERT INTO vision_months (symbol, dataset, month, rows) VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol, dataset, month) DO UPDATE SET rows=excluded.rows
+            """,
+            (symbol, interval, month, len(rows)),
+        )
+        self.conn.commit()
+
+    def write_vision_funding(self, symbol: str, month: str, rows: list[dict]) -> None:
+        if rows:
+            self.conn.executemany(
+                """
+                INSERT INTO funding (symbol, funding_time, funding_rate) VALUES (?, ?, ?)
+                ON CONFLICT(symbol, funding_time) DO UPDATE SET funding_rate=excluded.funding_rate
+                """,
+                [(symbol, int(row["funding_time"]), float(row["funding_rate"])) for row in rows],
+            )
+        self.conn.execute(
+            """
+            INSERT INTO vision_months (symbol, dataset, month, rows) VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol, dataset, month) DO UPDATE SET rows=excluded.rows
+            """,
+            (symbol, "funding", month, len(rows)),
+        )
+        self.conn.commit()
+
+    def max_daily_quote_volume(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT symbol, MAX(quote_volume) AS max_quote_volume, COUNT(*) AS bars,
+                   MIN(open_time) AS first_open, MAX(open_time) AS last_open
+            FROM klines
+            WHERE interval = '1d'
+            GROUP BY symbol
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def symbols_with_interval(self, interval: str) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT symbol FROM klines WHERE interval = ? ORDER BY symbol",
+            (interval,),
+        )
+        return [row["symbol"] for row in rows]
 
     def journal(self, ts_ms: int, kind: str, payload: dict) -> None:
         self.conn.execute(

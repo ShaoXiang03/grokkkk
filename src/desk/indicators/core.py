@@ -65,9 +65,11 @@ def rsi_wilder(series: pd.Series, period: int) -> pd.Series:
 
 
 def _rsi_from_averages(avg_gain: float, avg_loss: float) -> float:
-    if avg_loss == 0:
+    if avg_loss == 0 or not np.isfinite(avg_loss) or not np.isfinite(avg_gain):
         return 100.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
+    if not np.isfinite(rs):
+        return 100.0
     return 100.0 - (100.0 / (1.0 + rs))
 
 

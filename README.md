@@ -46,13 +46,21 @@ If `fapi.binance.com` returns HTTP 451 (restricted location), use the public mon
 python3 scripts/backfill.py --source vision --symbols BTCUSDT ETHUSDT SOLUSDT --days 120 --daily-days 400
 ```
 
-Vision does not include `exchangeInfo`. The loader stores the first archived daily open it can find as the listing timestamp and marks the requested symbols `TRADING`. That is weaker than a live `exchangeInfo` check: delisted contracts are still missing, and the status was not confirmed by the exchange. `--all-universe` only works against REST `exchangeInfo`.
+The full archive, including contracts Vision still hosts after they stop trading:
 
-`--all-universe` stores every current USDT-M perpetual. That is a large download. REST klines update incrementally: a later run continues from the last stored open time and replaces that candle.
+```bash
+python3 scripts/backfill.py --source vision --all-universe --start 2019-09 --end 2026-10 --workers 12
+```
+
+That command lists every USD-M prefix on `data.binance.vision`, keeps names that end in `USDT` and have no delivery suffix, and downloads the monthly files in parallel. Completed months are recorded in SQLite and the zip bytes are cached under `data/vision-cache/`, so a second run resumes. After the daily files, a name is kept for 1h, 4h, and funding only when its best UTC day is at least half of the loosest quote-volume gate (`--min-daily-quote-volume`, default 500000). A 24h window sits inside two UTC days, so a name below that ceiling cannot pass the gate. The per-bar volume, spread, listing-age, and funding gates still apply during the backtest.
+
+Vision does not include `exchangeInfo`. The listing time is the first archived daily open. A name whose last daily bar is more than three days before the archive's latest daily bar is stored as `DELISTED`; the others are stored as `TRADING`. That is an inference, not an exchange status. On a historical bar the product gate treats a stored USDT-M perpetual as listed, because the bar itself is the evidence it was trading then. `delisted_symbols_included` counts the non-`TRADING` rows that were actually loaded.
+
+`--all-universe` against REST still needs `exchangeInfo` and only sees contracts listed at download time. REST klines update incrementally: a later run continues from the last stored open time and replaces that candle.
 
 SQLite defaults to `data/desk.sqlite` (gitignored).
 
-**Survivorship.** `exchangeInfo` returns contracts listed at download time. Delisted perpetuals are not in that payload, so a backtest on this cache is biased toward survivors unless a historical archive is imported into the `symbols` table. The report's `delisted_symbols_included` count is the number of non-`TRADING` USDT-M rows actually stored (often zero). Volume, listing age, and the last **settled** funding rate are applied as of each bar. Historical books are not in klines; the backtest uses `backtest.assumed_spread_pct` and labels that assumption. The predicted funding rate is not archived, so the backtest reuses the last settled rate (`funding_predicted_model: persist_last_settled`) and says so. News vetoes are not modeled.
+**Survivorship.** A REST cache is biased toward contracts that are still listed. The Vision `--all-universe` path keeps delisted names the archive still publishes, and the report counts how many of those were scanned. Volume, listing age, and the last **settled** funding rate are applied as of each bar. Historical books are not in klines; the backtest uses `backtest.assumed_spread_pct` and labels that assumption. The predicted funding rate is not archived, so the backtest reuses the last settled rate (`funding_predicted_model: persist_last_settled`) and says so. News vetoes are not modeled.
 
 ## Scanner
 
@@ -107,6 +115,14 @@ Costs in every trade: 0.05% taker fee per side, half the spread plus `costs.slip
 
 The report, written to `reports/backtest.json`, has per-setup and overall trade count, win rate, average R, expectancy (mean R), max drawdown, and Sharpe (daily returns, sample standard deviation, √365). Walk-forward uses a 182-day in-sample window and a 91-day out-of-sample window with **frozen** parameters. If the sample is shorter than one full pair of windows, out-of-sample metrics are null and the report says so. Quote out-of-sample only after a sample actually covers a fold. Nothing here is a performance target.
 
+The exit study compares the v0.3 4H trail with later arms, chandelier trails, and a 3-bar structure trail, at a 1R partial and a 2R partial. Setup B variants each change one filter (EMA separation, the caution regime, a 3-bar initial stop, or an EMA20 tag). The hard stop is never widened. Run it after the archive backfill:
+
+```bash
+python3 scripts/run_research.py --workers 3
+```
+
+It writes `reports/backtest-YYYYMMDD.md` and matching CSVs. A variant becomes the default in `config/settings.yaml` only when it wins a strict majority of in-sample folds and its frozen out-of-sample record is positive, beats the baseline, and is not materially deeper in drawdown. Otherwise the v0.3 switches stay. The rule is in `desk.backtest.selection`. In-sample luck is not an edge.
+
 ## Rules coded here
 
 * Universe: live USDT-M perpetual, 14-day listing age, 24h quote volume (5M for A–C, 1M for D), spread (0.15% / 0.50%), funding sanity at ±0.05% per 8h. Missing data fails closed.
@@ -127,4 +143,4 @@ Do not point this process at a live account.
 * **M5 — paper.** Simulated fills on live public prices for the 14-day Asia/Kuala_Lumpur clock, and a separate testnet check that an isolated order and its hard stop are accepted together. Kill-switch file. Risk gates re-read real equity; if equity or P&L cannot be read, new entries fail closed. If the stop cannot be placed, the entry is cancelled. No withdrawal permission on any key.
 * **M6 — first live, only if Shaoxiang turns it on.** Trade-only key, withdrawals disabled, IP-restricted to the Alibaba server, secret stored in `config/secrets.env` on that server and nowhere else. Risk scale 0.5. Go-live checks come from the journal, not from P&L. This repository should still not contain the key.
 
-Also still open for a faithful backtest: a delisted-contract archive, historical predicted funding, historical books, News Watcher history, and an on-chain source for Setup D. Lot size and tick size filters matter before any order path exists. The liquidation price here is the simplified isolated formula, not Binance's tiered cumulative maintenance table.
+Also still open for a faithful backtest: historical predicted funding, historical books, News Watcher history, and an on-chain source for Setup D. The Vision path reduces survivorship bias only for contracts the archive still hosts. Lot size and tick size filters matter before any order path exists. The liquidation price here is the simplified isolated formula, not Binance's tiered cumulative maintenance table.

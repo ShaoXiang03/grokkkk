@@ -102,3 +102,100 @@ def load_funding_month(session, symbol: str, month: str, timeout: float) -> list
     if payload is None:
         return None
     return parse_funding_csv(_zip_text(payload))
+
+
+def is_um_usdt_perpetual_symbol(name: str) -> bool:
+    """USD-M perpetual names have no delivery suffix. USDC and dated contracts are out."""
+    if not name or "_" in name:
+        return False
+    return name.endswith("USDT") and name.isalnum()
+
+
+def list_common_prefixes(session, prefix: str, timeout: float) -> list[str]:
+    """List S3 common prefixes under data.binance.vision. Public read, no credentials."""
+    import xml.etree.ElementTree as ET
+
+    ns = {"s": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    base = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+    marker = None
+    found: list[str] = []
+    while True:
+        params = {"delimiter": "/", "prefix": prefix, "max-keys": "1000"}
+        if marker:
+            params["marker"] = marker
+        response = session.get(base, params=params, timeout=timeout)
+        if response.status_code != 200:
+            raise RuntimeError(f"vision listing returned HTTP {response.status_code}")
+        root = ET.fromstring(response.content)
+        for node in root.findall("s:CommonPrefixes/s:Prefix", ns):
+            text = node.text or ""
+            name = text[len(prefix) :].strip("/")
+            if name:
+                found.append(name)
+        truncated = root.findtext("s:IsTruncated", default="false", namespaces=ns)
+        if truncated != "true":
+            break
+        marker = root.findtext("s:NextMarker", default=None, namespaces=ns)
+        if not marker:
+            break
+    return found
+
+
+def list_um_usdt_perpetuals(session, timeout: float) -> list[str]:
+    prefix = "data/futures/um/monthly/klines/"
+    names = list_common_prefixes(session, prefix, timeout)
+    return sorted(name for name in names if is_um_usdt_perpetual_symbol(name))
+
+
+def cache_file(cache_dir, kind: str, symbol: str, month: str, interval: str | None = None):
+    from pathlib import Path
+
+    root = Path(cache_dir)
+    if kind == "funding":
+        return root / "funding" / symbol / f"{month}.zip"
+    if not interval:
+        raise ValueError("interval is required for kline cache files")
+    return root / "klines" / symbol / interval / f"{month}.zip"
+
+
+def load_cached_zip(session, url: str, path, timeout: float) -> bytes | None:
+    """Return zip bytes, using a file cache. A `.missing` marker remembers HTTP 404."""
+    from pathlib import Path
+
+    path = Path(path)
+    missing = path.with_suffix(path.suffix + ".missing")
+    if missing.exists():
+        return None
+    if path.exists() and path.stat().st_size > 0:
+        return path.read_bytes()
+    payload = fetch_bytes(url, session, timeout)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if payload is None:
+        missing.write_bytes(b"")
+        return None
+    path.write_bytes(payload)
+    return payload
+
+
+def load_klines_month_cached(session, cache_dir, symbol: str, interval: str, month: str, timeout: float) -> list[dict] | None:
+    path = cache_file(cache_dir, "klines", symbol, month, interval)
+    payload = load_cached_zip(session, kline_url(symbol, interval, month), path, timeout)
+    if payload is None:
+        return None
+    try:
+        return parse_kline_csv(_zip_text(payload))
+    except (zipfile.BadZipFile, IndexError, UnicodeDecodeError, ValueError):
+        path.unlink(missing_ok=True)
+        raise
+
+
+def load_funding_month_cached(session, cache_dir, symbol: str, month: str, timeout: float) -> list[dict] | None:
+    path = cache_file(cache_dir, "funding", symbol, month)
+    payload = load_cached_zip(session, funding_url(symbol, month), path, timeout)
+    if payload is None:
+        return None
+    try:
+        return parse_funding_csv(_zip_text(payload))
+    except (zipfile.BadZipFile, IndexError, UnicodeDecodeError, ValueError):
+        path.unlink(missing_ok=True)
+        raise
