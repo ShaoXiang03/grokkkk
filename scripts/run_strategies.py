@@ -243,7 +243,7 @@ def main() -> None:
         "A gap through the 1.5× shock can lose more than the budgeted risk before the brake fills. "
         "Each new name requests 2% of equity (1% on the E6 fade). A cluster above 3% is scaled down first (BTC, ETH, a fixed L1 list, and the rest are separate; longs and shorts in one cluster both count). "
         "The book is then scaled so total open risk is at most 6%. Notional is clipped at 3× equity and the freed risk is not reallocated. "
-        "An all-alt book therefore runs at 3% open risk, not 6%. "
+        "An all-alt book therefore runs at 3% open risk, not 6%, split across the names. A slice below 0.05% of equity is dropped; the scanner's 0.5% single-trade floor is not applied, because it would delete every name in a 12-name alt cluster. "
         "E2 uses one gross figure per leg so the legs match before the 3× clip. "
         "E3 and E6 risk to the stop they actually exit on. E5 targets 20% annualised volatility and is then scaled down until the same caps hold. It is not scaled up to the caps.",
         "",

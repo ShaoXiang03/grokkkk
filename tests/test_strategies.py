@@ -226,8 +226,7 @@ def test_equal_risk_cluster_cap_and_leverage_cap():
     sized = notionals_from_risk(rows, equity)
     # 4 alts at 2% request 8%. The alt cluster caps that at 3% before the 6% total.
     assert sum(item.notional * item.stop_pct for item in sized) == pytest.approx(0.03 * equity, rel=1e-6)
-    # 3x times a 0.2% stop is 0.6% of equity, still above the 0.5% minimum.
-    # A tighter stop would be skipped rather than held at a dust risk.
+    # 3x times a 0.2% stop is 0.6% of equity, above the 0.05% portfolio floor.
     tiny = [{"symbol": "TINYUSDT", "side": 1, "stop_pct": 0.002, "cluster": "btc", "risk_fraction": 0.02, "score": 1}]
     capped = notionals_from_risk(tiny, equity)
     assert capped[0].notional == pytest.approx(3 * equity)

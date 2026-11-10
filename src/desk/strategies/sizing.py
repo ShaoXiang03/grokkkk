@@ -32,9 +32,9 @@ Allocation order for equal-risk books
    reduces that name's risk. Freed risk is not given to other names.
 
 Keeps (a trend position already open) are scaled only if they themselves
-breach a cap. New entries then use whatever room is left. A name below
-0.5% of equity after the clip is skipped, matching the scanner's
-``min_risk_after_cap_pct``.
+breach a cap. New entries then use whatever room is left. A slice below
+0.05% of equity is dropped. The scanner's 0.5% floor is not used here,
+because that floor would delete every alt in a 12-name cluster.
 
 Inverse-vol books (E2) use one gross figure per leg so the two legs have
 the same notional before the 3× clip. The gross is the largest value that
@@ -52,7 +52,10 @@ MAX_NAME_RISK = 0.02
 MAX_TOTAL_RISK = 0.06
 MAX_CLUSTER_RISK = 0.03
 MAX_LEVERAGE = 3.0
-MIN_RISK_AFTER_CAP = 0.005
+# The scanner skips a single setup whose notional cap leaves less than 0.5%.
+# A portfolio splits the same 3% cluster budget across many names, so a slice
+# near 0.25% is the book, not dust. Only a slice below 0.05% is dropped.
+PORTFOLIO_MIN_RISK = 0.0005
 SHOCK_ATR = 1.5
 CATASTROPHE_ATR = 5.0
 
@@ -138,7 +141,7 @@ def notionals_from_risk(
         if notional > max_notional:
             notional = max_notional
             dollars = notional * stop_pct
-        if dollars < MIN_RISK_AFTER_CAP * equity:
+        if dollars < PORTFOLIO_MIN_RISK * equity:
             continue
         side = 1 if int(row["side"]) >= 0 else -1
         sized.append(Sized(symbol=symbol, side=side, notional=notional, stop_pct=stop_pct))
@@ -205,7 +208,7 @@ def inverse_vol_balanced(rows: list[dict], equity: float) -> list[Sized]:
         if notional > max_notional:
             notional = max_notional
         dollars = notional * float(row["stop_pct"])
-        if dollars < MIN_RISK_AFTER_CAP * equity:
+        if dollars < PORTFOLIO_MIN_RISK * equity:
             continue
         sized.append(Sized(symbol=row["symbol"], side=side, notional=notional, stop_pct=float(row["stop_pct"])))
     return sized
@@ -256,7 +259,7 @@ def scale_to_caps(rows: list[dict], equity: float) -> list[Sized]:
     for row, weight in prepared:
         notional = equity * weight * limit
         dollars = notional * float(row["stop_pct"])
-        if dollars < MIN_RISK_AFTER_CAP * equity:
+        if dollars < PORTFOLIO_MIN_RISK * equity:
             continue
         side = 1 if int(row["side"]) >= 0 else -1
         sized.append(Sized(symbol=row["symbol"], side=side, notional=notional, stop_pct=float(row["stop_pct"])))
@@ -282,13 +285,13 @@ def greedy_fill(rows: list[dict], equity: float, *, used_total: float = 0.0, use
         cluster = row.get("cluster") or "alts"
         fraction = min(float(row.get("risk_fraction", MAX_NAME_RISK)), MAX_NAME_RISK)
         dollars = min(fraction * equity, room_total, room_cluster[cluster])
-        if dollars < MIN_RISK_AFTER_CAP * equity:
+        if dollars < PORTFOLIO_MIN_RISK * equity:
             continue
         notional = dollars / stop_pct
         if notional > max_notional:
             notional = max_notional
             dollars = notional * stop_pct
-        if dollars < MIN_RISK_AFTER_CAP * equity:
+        if dollars < PORTFOLIO_MIN_RISK * equity:
             continue
         side = 1 if int(row["side"]) >= 0 else -1
         sized.append(Sized(symbol=row["symbol"], side=side, notional=notional, stop_pct=stop_pct))
