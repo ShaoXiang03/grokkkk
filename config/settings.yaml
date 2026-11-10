@@ -205,15 +205,17 @@ backtest:
 # 2025-01..2026-10 hold-out finished above the start after fees, slippage,
 # and funding. Otherwise it stays off.
 strategies:
+  # Hold-out 2025-01..2026-10, frozen variant, after fees, slippage, and funding.
+  # e1 -14.9%, e4 -41.2%, e5 -16.7% stay off.
   e1_cs_momentum:
     enabled: false
   e2_residual_momentum:
-    enabled: false
+    enabled: true
   e3_slow_trend:
-    enabled: false
+    enabled: true
   e4_funding_carry:
     enabled: false
   e5_positioning_trend:
     enabled: false
   e6_liquidation_proxy:
-    enabled: false
+    enabled: true

@@ -474,27 +474,28 @@ def simulate(features: Features, decide_name: str, params: dict, start_ms: int, 
                 close_position(symbol, raw, i, "gap_stop")
 
         # Funding inside (today's open, next open]. Charged if we still hold after the open.
-        hi = int(features.day_ms[i]) + DAY_MS
-        lo = int(features.day_ms[i])
-        for symbol, pos in list(positions.items()):
-            events = features.panel.funding_events.get(symbol)
-            if not events:
-                continue
-            times, rates, _hours = events
-            if times.size == 0:
-                continue
-            left = int(np.searchsorted(times, lo, side="right"))
-            right = int(np.searchsorted(times, hi, side="right"))
-            if right <= left:
-                continue
-            mark = mark_of(pos, i)
-            for rate in rates[left:right]:
-                if not np.isfinite(rate):
+        if params.get("charge_funding", True):
+            hi = int(features.day_ms[i]) + DAY_MS
+            lo = int(features.day_ms[i])
+            for symbol, pos in list(positions.items()):
+                events = features.panel.funding_events.get(symbol)
+                if not events:
                     continue
-                change = -pos.qty * mark * float(rate)
-                cash += change
-                pos.gross_cash += change
-                funding_pnl += change
+                times, rates, _hours = events
+                if times.size == 0:
+                    continue
+                left = int(np.searchsorted(times, lo, side="right"))
+                right = int(np.searchsorted(times, hi, side="right"))
+                if right <= left:
+                    continue
+                mark = mark_of(pos, i)
+                for rate in rates[left:right]:
+                    if not np.isfinite(rate):
+                        continue
+                    change = -pos.qty * mark * float(rate)
+                    cash += change
+                    pos.gross_cash += change
+                    funding_pnl += change
 
         # Intrabar event stop and target. Stop wins if both trade.
         for symbol in list(positions):
@@ -596,8 +597,18 @@ def simulate(features: Features, decide_name: str, params: dict, start_ms: int, 
             days.append(int(features.day_ms[i]))
             break
 
-        equities.append(equity_at(i))
+        marked = equity_at(i)
+        if marked <= 0 and positions:
+            # Isolated margin would be gone. Floor the account at zero instead of
+            # carrying a deficit, and drop the positions.
+            positions.clear()
+            cash = 0.0
+            marked = 0.0
+            pending = (i, [])
+        equities.append(marked)
         days.append(int(features.day_ms[i]))
+        if marked <= 0:
+            continue
         held = {symbol: pos.side for symbol, pos in positions.items()}
         decision = decide(features, i, held, params)
         if decision is None:
@@ -628,8 +639,13 @@ def simulate(features: Features, decide_name: str, params: dict, start_ms: int, 
     )
 
 
-def simulate_buy_hold(features: Features, start_ms: int, end_ms: int, initial_equity: float, params: dict | None = None) -> SimResult:
-    """1x long BTCUSDT, entered at the first open, funded, one entry and one exit."""
+def simulate_buy_hold(features: Features, start_ms: int, end_ms: int, initial_equity: float, params: dict | None = None, *, funded: bool = False) -> SimResult:
+    """1x long BTCUSDT from the first open to the last close.
+
+    The default is the price path: entry and exit costs, no funding. A funded
+    perp hold pays the archived rate on the mark notional and can be wiped by
+    that cash drag when the price gives the gains back.
+    """
     params = dict(params or {})
     params.setdefault("fee_rate", 0.0005)
     params.setdefault("slip_top", 0.0004)
@@ -657,9 +673,12 @@ def simulate_buy_hold(features: Features, start_ms: int, end_ms: int, initial_eq
 
     DECISIONS["btc_hold"] = _once
     try:
-        # The fixed sizer uses stop_pct only for metadata. decision_atr=1 and
-        # risk_atr_mult=1 would imply a 100% stop if we went through equal-risk.
-        # size_mode fixed ignores that.
+        # Spot-style 1x: one entry, mark to the daily close, entry and exit
+        # costs, no funding. A perp hold pays funding on the risen notional and
+        # is a different trade; the report says so.
+        params = dict(params)
+        params["charge_funding"] = bool(funded)
+        params.setdefault("fee_rate", 0.0005)
         return simulate(features, "btc_hold", params, start_ms, end_ms, initial_equity)
     finally:
         DECISIONS.pop("btc_hold", None)

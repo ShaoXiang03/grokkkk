@@ -44,8 +44,10 @@ def sharpe(returns: np.ndarray) -> float | None:
 
 
 def cagr(start_equity: float, end_equity: float, n_days: int) -> float | None:
-    if start_equity <= 0 or end_equity <= 0 or n_days <= 1:
+    if start_equity <= 0 or n_days <= 1:
         return None
+    if end_equity <= 0:
+        return -1.0
     return float((end_equity / start_equity) ** (365.0 / n_days) - 1.0)
 
 

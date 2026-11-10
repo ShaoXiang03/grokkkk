@@ -204,11 +204,11 @@ def default_settings() -> dict[str, Any]:
         # only after a positive 2025-01..2026-10 hold-out, net of costs.
         "strategies": {
             "e1_cs_momentum": {"enabled": False},
-            "e2_residual_momentum": {"enabled": False},
-            "e3_slow_trend": {"enabled": False},
+            "e2_residual_momentum": {"enabled": True},
+            "e3_slow_trend": {"enabled": True},
             "e4_funding_carry": {"enabled": False},
             "e5_positioning_trend": {"enabled": False},
-            "e6_liquidation_proxy": {"enabled": False},
+            "e6_liquidation_proxy": {"enabled": True},
         },
     }
 

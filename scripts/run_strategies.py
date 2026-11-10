@@ -287,8 +287,9 @@ def main() -> None:
     )
     lines.append("")
     lines.append(
-        f"BTC 1x buy-and-hold, same fee and funding model: development CAGR {_pct(btc_dev.get('cagr'))}, Sharpe {_num(btc_dev.get('sharpe'))}, max DD {_pct(btc_dev.get('max_dd'))}. "
-        f"Hold-out CAGR {_pct(btc_hold.get('cagr'))}, Sharpe {_num(btc_hold.get('sharpe'))}, max DD {_pct(btc_hold.get('max_dd'))}."
+        f"BTC 1x price path, entry and exit costs, no funding: development CAGR {_pct(btc_dev.get('cagr'))}, Sharpe {_num(btc_dev.get('sharpe'))}, max DD {_pct(btc_dev.get('max_dd'))}. "
+        f"Hold-out CAGR {_pct(btc_hold.get('cagr'))}, Sharpe {_num(btc_hold.get('sharpe'))}, max DD {_pct(btc_hold.get('max_dd'))}. "
+        "A funded 1x perp long is a different trade: it pays the archived funding rate on the mark notional, so the cash drag stays after the price gives the gains back."
     )
     lines.append("")
     lines.append(
@@ -303,7 +304,8 @@ def main() -> None:
         lines.append("Hold-out Sharpe against the equal-weight survivor book: " + "; ".join(bits) + ".")
         if combo_hold is not None:
             lines.append(
-                f"Survivor book CAGR {_pct(combo_hold.get('cagr'))}, Sharpe {_num(combo_hold.get('sharpe'))}, max DD {_pct(combo_hold.get('max_dd'))}."
+                f"Survivor book CAGR {_pct(combo_hold.get('cagr'))}, Sharpe {_num(combo_hold.get('sharpe'))}, max DD {_pct(combo_hold.get('max_dd'))}. "
+                "That Sharpe is higher, and the drawdown smaller, than each sleeve alone. The CAGR is not: it sits below the stronger sleeves because the book equal-weights a thin event sleeve with the two portfolio sleeves."
             )
     lines.append("")
     lines.append("## Per book")
@@ -393,6 +395,11 @@ def main() -> None:
             + ", ".join(f"`{name}`" for name in turned)
             + ". The others stay disabled. A positive hold-out on one window is not a licence to trade size."
         )
+        if enabled.get("e6_liquidation_proxy"):
+            lines.append(
+                "E6 clears that rule on a handful of hold-out trades and a low deflated Sharpe. "
+                "The flag is the mechanical rule. It is not evidence of a liquidation-fade edge."
+            )
     lines.append("")
     lines.append("## Caveats")
     lines.append("")
