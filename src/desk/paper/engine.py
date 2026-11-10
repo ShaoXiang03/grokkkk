@@ -26,8 +26,9 @@ from desk.delivery.eligibility import entry_blocks, expire_pending
 from desk.delivery.outbox import drain_outbox
 from desk.indicators.core import add_indicators, ema_column
 from desk.journal.decision import DecisionJournal
+from desk.paper.books import book_contribution, fill_books, propose_books, reduce_books
 from desk.paper.clock import myt_week_key
-from desk.paper.scorecard import build_scorecard
+from desk.paper.scorecard import build_scorecard, note_drift
 from desk.paper.state import dump_position, load_position
 from desk.rules.risk_gates import _as_float
 from desk.scanner.service import scan_once
@@ -116,6 +117,7 @@ def position_view(pos) -> dict:
         "direction": pos.direction,
         "cluster_key": pos.cluster_key,
         "risk_usdt": position_risk_usdt(pos),
+        "notional_usdt": abs(float(pos.remaining) * float(pos.fill)),
     }
 
 
@@ -146,7 +148,12 @@ def marked_equity(store, settings: dict, now_ms: int) -> dict | None:
         unrealized += directional_pnl(pos.direction, pos.remaining, pos.fill, mark)
         open_realized += float(pos.realized)
         views.append(position_view(pos))
-    equity = initial + realized + open_realized + unrealized
+    books = book_contribution(store, now_ms)
+    if books is None:
+        return None
+    book_pnl, book_views = books
+    views.extend(book_views)
+    equity = initial + realized + open_realized + unrealized + book_pnl
     day_key = str(myt_date(now_ms))
     week_key = myt_week_key(now_ms)
     day_start = _as_float(account.get("day_start_equity"))
@@ -326,6 +333,8 @@ def fill_pending(store, settings: dict, now_ms: int, snapshot: dict, journal: De
         "news_status": snapshot["news_status"],
     }
     for packet in store.list_signal_packets(status="proposed"):
+        if packet.get("packet_kind") in ("rebalance", "book_entry"):
+            continue
         signal_id = packet["signal_id"]
         if store.resolution(signal_id) is not None:
             continue
@@ -412,6 +421,7 @@ def run_cycle(
         closed = manage_positions(store, settings, now_ms)
         for trade in closed:
             _journal_exit(journal, trade, now_ms)
+        book_closed = reduce_books(settings, store, now_ms, journal, kill=None)
         fresh, fresh_reason = data_is_fresh(store, chosen, now_ms, settings)
         kill = kill_switch_reason(settings)
         flattened: list[dict] = []
@@ -422,6 +432,8 @@ def run_cycle(
             if waiting:
                 fresh = False
                 fresh_reason = "kill switch waiting for a fresh bar: " + ",".join(waiting)
+        if kill:
+            book_closed.extend(reduce_books(settings, store, now_ms, journal, kill=kill))
         snapshot = marked_equity(store, settings, now_ms)
         block = None
         block_detail = ""
@@ -438,6 +450,8 @@ def run_cycle(
         expired = expire_pending(store, settings, now_ms, journal)
         scanned: list[dict] = []
         filled: list[dict] = []
+        book_filled: list[dict] = []
+        proposed: list[dict] = []
         refused: list[str] = []
         if block is None and snapshot is not None:
             account = {
@@ -456,7 +470,11 @@ def run_cycle(
                 onchain_raw=onchain_raw,
             )
             snapshot = marked_equity(store, settings, now_ms) or snapshot
+            proposed = propose_books(settings, store, now_ms, journal, snapshot)
+            snapshot = marked_equity(store, settings, now_ms) or snapshot
             filled = fill_pending(store, settings, now_ms, snapshot, journal)
+            snapshot = marked_equity(store, settings, now_ms) or snapshot
+            book_filled = fill_books(settings, store, now_ms, journal, snapshot)
         elif block == "kill_switch":
             refused = refuse_pending_opens(store, settings, now_ms, journal, "kill_switch")
         webhook = []
@@ -472,6 +490,8 @@ def run_cycle(
             current["as_of_ms"] = None
             current["equity_usdt"] = None
             store.save_paper_account(current)
+        scorecard = build_scorecard(store, settings, now_ms)
+        note_drift(store, settings, journal, now_ms, scorecard)
         return {
             "cycle_ms": int(now_ms),
             "block": block,
@@ -479,10 +499,15 @@ def run_cycle(
             "scanned": len(scanned),
             "filled": filled,
             "expired": [row["signal_id"] for row in expired],
-            "closed": [trade["signal_id"] for trade in closed + flattened],
+            "closed": [trade["signal_id"] for trade in closed + flattened + book_closed],
             "refused": refused,
             "webhook": webhook,
-            "scorecard": build_scorecard(store, settings, now_ms),
+            "books": {
+                "proposed": [packet["signal_id"] for packet in proposed],
+                "filled": [row["signal_id"] for row in book_filled],
+                "exited": [trade["signal_id"] for trade in book_closed],
+            },
+            "scorecard": scorecard,
         }
 
 

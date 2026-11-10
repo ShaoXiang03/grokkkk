@@ -186,6 +186,18 @@ CREATE TABLE IF NOT EXISTS paper_violations (
     signal_id TEXT,
     detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS paper_book_positions (
+    book TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (book, symbol)
+);
+CREATE TABLE IF NOT EXISTS paper_book_meta (
+    book TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL
+);
 """
 
 
@@ -875,6 +887,51 @@ class Store:
     def paper_position_rows(self) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM paper_positions ORDER BY symbol")
         return [dict(row) for row in rows]
+
+    def save_book_position(self, book: str, symbol: str, payload: str, updated_ms: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_book_positions (book, symbol, payload, updated_ms)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(book, symbol) DO UPDATE SET
+                payload=excluded.payload, updated_ms=excluded.updated_ms
+            """,
+            (book, symbol, payload, int(updated_ms)),
+        )
+        self.conn.commit()
+
+    def delete_book_position(self, book: str, symbol: str) -> None:
+        self.conn.execute(
+            "DELETE FROM paper_book_positions WHERE book = ? AND symbol = ?",
+            (book, symbol),
+        )
+        self.conn.commit()
+
+    def book_position_rows(self, book: str | None = None) -> list[dict]:
+        if book is None:
+            rows = self.conn.execute("SELECT * FROM paper_book_positions ORDER BY book, symbol")
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM paper_book_positions WHERE book = ? ORDER BY symbol",
+                (book,),
+            )
+        return [dict(row) for row in rows]
+
+    def book_meta(self, book: str) -> dict | None:
+        row = self.conn.execute("SELECT payload FROM paper_book_meta WHERE book = ?", (book,)).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload"])
+
+    def save_book_meta(self, book: str, payload: dict, updated_ms: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO paper_book_meta (book, payload, updated_ms) VALUES (?, ?, ?)
+            ON CONFLICT(book) DO UPDATE SET payload=excluded.payload, updated_ms=excluded.updated_ms
+            """,
+            (book, json.dumps(payload, sort_keys=True, default=str), int(updated_ms)),
+        )
+        self.conn.commit()
 
     def save_paper_trade(self, trade: dict) -> None:
         self.conn.execute(

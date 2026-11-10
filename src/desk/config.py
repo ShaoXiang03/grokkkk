@@ -177,6 +177,12 @@ def default_settings() -> dict[str, Any]:
             "max_data_age_seconds": 5400,
             "kill_switch_path": "data/KILL",
             "loop_seconds": 60,
+            "drift": {
+                "min_days": 7,
+                "turnover_rel": 0.50,
+                "slippage_rel": 0.50,
+                "return_abs": 0.05,
+            },
         },
         "journal": {
             "jsonl_path": "data/journal.jsonl",
@@ -200,15 +206,37 @@ def default_settings() -> dict[str, Any]:
             "walk_forward_out_sample_days": 91,
             "close_at_end": True,
         },
-        # Research books. The 4h scanner does not emit these. enabled is set
-        # only after a positive 2025-01..2026-10 hold-out, net of costs.
+        # Research books. E2 and E3 are the paper books. E6 stays off: the
+        # hold-out was 11 trades. The E6 code is unchanged.
         "strategies": {
             "e1_cs_momentum": {"enabled": False},
-            "e2_residual_momentum": {"enabled": True},
-            "e3_slow_trend": {"enabled": True},
+            "e2_residual_momentum": {
+                "enabled": True,
+                "variant": "e2_r15_b60_v30_top25",
+                "expected": {
+                    "turnover_per_year": 20.71,
+                    "slippage_usdt": 298.0,
+                    "start_equity": 10000.0,
+                    "days": 669,
+                    "cagr": 0.143,
+                    "total_return": 0.278,
+                },
+            },
+            "e3_slow_trend": {
+                "enabled": True,
+                "variant": "e3a_sma50_trail3_top40",
+                "expected": {
+                    "turnover_per_year": 18.55,
+                    "slippage_usdt": 252.0,
+                    "start_equity": 10000.0,
+                    "days": 669,
+                    "cagr": 0.169,
+                    "total_return": 0.331,
+                },
+            },
             "e4_funding_carry": {"enabled": False},
             "e5_positioning_trend": {"enabled": False},
-            "e6_liquidation_proxy": {"enabled": True},
+            "e6_liquidation_proxy": {"enabled": False},
         },
     }
 
