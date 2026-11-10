@@ -265,6 +265,10 @@ def fresh_account_blocks(
     cannot clear a name this function returns. Setup-specific caps stay in this
     module; delivery and the paper loop only consume the names.
     """
+    if packet.get("packet_kind") in ("rebalance", "book_entry"):
+        from desk.paper.books import book_fresh_blocks
+
+        return book_fresh_blocks(packet, account, open_positions, settings, now_ms)
     blocks: list[str] = []
     equity = _as_float(None if account is None else account.get("equity_usdt"))
     risk = _as_float(packet.get("risk_usdt"))

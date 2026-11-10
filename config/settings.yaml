@@ -27,9 +27,11 @@ universe:
   funding_long_max: 0.0005
   funding_short_min: -0.0005
 
+# v0.3 setups stay off. The full-universe study did not show an out-of-sample
+# edge. This paper process runs the E2 and E3 books below, not setups A–D.
 setups:
   squeeze_breakout:
-    enabled: true
+    enabled: false
     bandwidth_lookback: 20
     volume_mult: 1.5
     trigger_bars: 4
@@ -40,7 +42,7 @@ setups:
     risk_pct: 0.02
     max_leverage: 3
   trend_pullback:
-    enabled: true
+    enabled: false
     rsi_long: [40, 55]
     rsi_short: [45, 60]
     trigger_bars: 8
@@ -56,7 +58,7 @@ setups:
     stop_swing_bars: 1
     require_fast_ema_tag: false
   range_reclaim:
-    enabled: true
+    enabled: false
     range_bars: 12
     min_range_bars: 8
     range_atr_mult: 1.5
@@ -69,7 +71,7 @@ setups:
     risk_pct: 0.02
     max_leverage: 3
   meme_momentum:
-    enabled: true
+    enabled: false
     breakout_lookback: 20
     volume_mult: 2.0
     trigger_bars: 4
@@ -168,10 +170,18 @@ review:
 paper:
   initial_equity: 800
   clock_days: 14
-  # A closed 1H bar older than this blocks new entries.
+  # A closed 1H bar older than this blocks new entries. It does not block
+  # a risk-reducing exit or stop that already has a closed daily bar.
   max_data_age_seconds: 5400
   kill_switch_path: data/KILL
   loop_seconds: 60
+  # Paper vs the 2025-01..2026-10 hold-out rates. An alert is journalled
+  # once the book has been running at least min_days and a gap exceeds the band.
+  drift:
+    min_days: 7
+    turnover_rel: 0.50
+    slippage_rel: 0.50
+    return_abs: 0.05
 
 journal:
   jsonl_path: data/journal.jsonl
@@ -200,22 +210,38 @@ backtest:
   walk_forward_out_sample_days: 91
   close_at_end: true
 
-# E1–E6 research books. The 4h scanner does not emit them and this build
-# still has no order path. A book is enabled only when its frozen variant's
-# 2025-01..2026-10 hold-out finished above the start after fees, slippage,
-# and funding. Otherwise it stays off.
+# E1–E6 research books. The paper loop runs an enabled book. It still has
+# no order path. E2 and E3 cleared the 2025-01..2026-10 hold-out. E6's
+# hold-out was positive on 11 trades, which is not enough evidence, so it
+# stays off. The E6 code and tests stay in the tree.
 strategies:
-  # Hold-out 2025-01..2026-10, frozen variant, after fees, slippage, and funding.
-  # e1 -14.9%, e4 -41.2%, e5 -16.7% stay off.
   e1_cs_momentum:
     enabled: false
   e2_residual_momentum:
     enabled: true
+    variant: e2_r15_b60_v30_top25
+    # Hold-out rates from reports/strategies-20261110.md. Start equity was
+    # 10000 over 2025-01-01..2026-10-31 (669 days).
+    expected:
+      turnover_per_year: 20.71
+      slippage_usdt: 298.0
+      start_equity: 10000.0
+      days: 669
+      cagr: 0.143
+      total_return: 0.278
   e3_slow_trend:
     enabled: true
+    variant: e3a_sma50_trail3_top40
+    expected:
+      turnover_per_year: 18.55
+      slippage_usdt: 252.0
+      start_equity: 10000.0
+      days: 669
+      cagr: 0.169
+      total_return: 0.331
   e4_funding_carry:
     enabled: false
   e5_positioning_trend:
     enabled: false
   e6_liquidation_proxy:
-    enabled: true
+    enabled: false
