@@ -85,6 +85,31 @@ def per_setup_curves(trades: list[dict], start_equity: float) -> dict[str, list[
     return {setup: equity_from_flows(start_equity, flows) for setup, flows in grouped.items()}
 
 
+def fill_flat_days(curve: list[tuple[int, float]], start_ms: int | None = None, end_ms: int | None = None) -> list[tuple[int, float]]:
+    """Insert one point per missing UTC day so flat periods count in the daily Sharpe."""
+    if not curve and start_ms is None:
+        return []
+    points = list(curve)
+    if start_ms is not None:
+        equity = points[0][1] if points else 0.0
+        if not points or start_ms < points[0][0]:
+            points.insert(0, (int(start_ms), equity if points else equity))
+    if end_ms is not None and points and end_ms > points[-1][0]:
+        points.append((int(end_ms), points[-1][1]))
+    if len(points) < 2:
+        return points
+    out = [points[0]]
+    for ts, equity in points[1:]:
+        prev_ts, prev_eq = out[-1]
+        day = (prev_ts - (prev_ts % DAY_MS)) + DAY_MS
+        last_day = ts - (ts % DAY_MS)
+        while day < last_day:
+            out.append((day + DAY_MS - 1, prev_eq))
+            day += DAY_MS
+        out.append((int(ts), equity))
+    return out
+
+
 def period_bounds(curve: list[tuple[int, float]], trades: list[dict]) -> dict:
     stamps = [ts for ts, _ in curve]
     if trades:

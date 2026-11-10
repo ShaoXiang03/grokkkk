@@ -14,6 +14,7 @@ import pandas as pd
 from desk.indicators.core import ema_column
 from desk.rules.exits import invalidation_text
 from desk.rules.regime import (
+    CAUTION,
     SETUP_MEME,
     SETUP_PULLBACK,
     SETUP_RECLAIM,
@@ -97,6 +98,25 @@ def squeeze_at(df: pd.DataFrame, i: int, direction: str, settings: dict) -> dict
     }
 
 
+def _pullback_geometry(df: pd.DataFrame, i: int, direction: str, atr: float, buffer_mult: float) -> dict:
+    """Stops use only bars at or before i. The 3-bar stop is stored even when the live stop is 1 bar."""
+    row = df.iloc[i]
+    low, high = float(row["low"]), float(row["high"])
+    buffer = buffer_mult * atr
+    swing_window = df.iloc[max(0, i - 2) : i + 1]
+    if direction == "long":
+        swing = low
+        stop = low - buffer
+        swing3 = float(swing_window["low"].min())
+        stop3 = swing3 - buffer
+    else:
+        swing = high
+        stop = high + buffer
+        swing3 = float(swing_window["high"].max())
+        stop3 = swing3 + buffer
+    return {"swing": swing, "stop": stop, "swing_3": swing3, "stop_3bar": stop3, "signal_low": low, "signal_high": high}
+
+
 def pullback_at(df: pd.DataFrame, i: int, direction: str, settings: dict) -> dict | None:
     cfg = settings["setups"][SETUP_PULLBACK]
     row = df.iloc[i]
@@ -107,33 +127,60 @@ def pullback_at(df: pd.DataFrame, i: int, direction: str, settings: dict) -> dic
     ema20, ema50, ema200 = float(row[col_fast]), float(row[col_mid]), float(row[col_slow])
     rsi = float(row["rsi_14"])
     low, high = float(row["low"]), float(row["high"])
+    atr = float(row["atr_14"])
+    if atr <= 0:
+        return None
+    tagged_fast = low <= ema20 <= high
+    tagged_mid = low <= ema50 <= high
     if direction == "long":
         if not (ema20 > ema50 > ema200):
             return None
         lo, hi = cfg["rsi_long"]
-        if not (float(lo) <= rsi <= float(hi)):
-            return None
-        tagged = (low <= ema20 <= high) or (low <= ema50 <= high)
-        if not tagged:
-            return None
-        stop = low - float(cfg["stop_atr_buffer"]) * float(row["atr_14"])
-        swing = low
+        gap_fast = (ema20 - ema50) / atr
+        gap_slow = (ema50 - ema200) / atr
     else:
         if not (ema20 < ema50 < ema200):
             return None
         lo, hi = cfg["rsi_short"]
-        if not (float(lo) <= rsi <= float(hi)):
-            return None
-        tagged = (low <= ema20 <= high) or (low <= ema50 <= high)
-        if not tagged:
-            return None
-        stop = high + float(cfg["stop_atr_buffer"]) * float(row["atr_14"])
-        swing = high
+        gap_fast = (ema50 - ema20) / atr
+        gap_slow = (ema200 - ema50) / atr
+    if not (float(lo) <= rsi <= float(hi)):
+        return None
+    if not (tagged_fast or tagged_mid):
+        return None
+    if bool(cfg.get("require_fast_ema_tag", False)) and not tagged_fast:
+        return None
+    min_gap = float(cfg.get("min_ema_gap_atr", 0) or 0)
+    if min_gap > 0 and (gap_fast < min_gap or gap_slow < min_gap):
+        return None
+    swing_bars = max(1, int(cfg.get("stop_swing_bars", 1)))
+    geometry = _pullback_geometry(df, i, direction, atr, float(cfg["stop_atr_buffer"]))
+    if swing_bars <= 1:
+        stop = geometry["stop"]
+        swing = geometry["swing"]
+    else:
+        window = df.iloc[max(0, i - swing_bars + 1) : i + 1]
+        if direction == "long":
+            swing = float(window["low"].min())
+            stop = swing - float(cfg["stop_atr_buffer"]) * atr
+        else:
+            swing = float(window["high"].max())
+            stop = swing + float(cfg["stop_atr_buffer"]) * atr
     return {
         "level": ema20,
         "provisional_stop": stop,
-        "atr": float(row["atr_14"]),
-        "meta": {"swing": swing, "signal_low": low, "signal_high": high},
+        "atr": atr,
+        "meta": {
+            "swing": swing,
+            "signal_low": geometry["signal_low"],
+            "signal_high": geometry["signal_high"],
+            "ema_gap_fast": gap_fast,
+            "ema_gap_slow": gap_slow,
+            "tagged_fast": tagged_fast,
+            "tagged_mid": tagged_mid,
+            "stop_3bar": geometry["stop_3bar"],
+            "swing_3": geometry["swing_3"],
+        },
     }
 
 
@@ -149,31 +196,43 @@ def reclaim_at(df: pd.DataFrame, i: int, direction: str, settings: dict) -> dict
     if range_bars < int(cfg["min_range_bars"]) or i < range_bars + 1:
         return None
     start_k = max(range_bars, i - lookback)
+    cached = df.attrs.get("_reclaim_np")
+    if cached is None or cached[0] != len(df):
+        cached = (
+            len(df),
+            df["high"].to_numpy(dtype=float, copy=False),
+            df["low"].to_numpy(dtype=float, copy=False),
+            df["close"].to_numpy(dtype=float, copy=False),
+            df["atr_14"].to_numpy(dtype=float, copy=False),
+        )
+        df.attrs["_reclaim_np"] = cached
+    _, highs, lows, closes, atrs = cached
+    mult = float(cfg["range_atr_mult"])
     for k in range(i - 1, start_k - 1, -1):
-        window = df.iloc[k - range_bars : k]
-        if len(window) < range_bars:
+        left = k - range_bars
+        if left < 0:
             continue
-        atr_row = df.iloc[k - 1]
-        if not _finite(atr_row["atr_14"]):
+        atr = atrs[k - 1]
+        if not _finite(atr):
             continue
-        atr = float(atr_row["atr_14"])
-        range_high = float(window["high"].max())
-        range_low = float(window["low"].min())
-        if range_high - range_low < float(cfg["range_atr_mult"]) * atr:
+        # pandas max/min skip NaN. These arrays are the kline columns, which are finite.
+        range_high = float(highs[left:k].max())
+        range_low = float(lows[left:k].min())
+        if range_high - range_low < mult * float(atr):
             continue
-        fake = df.iloc[k]
         if direction == "long":
-            broke = float(fake["low"]) < range_low or float(fake["close"]) < range_low
+            broke = lows[k] < range_low or closes[k] < range_low
             level = range_low
-            reclaimed = float(df.iloc[i]["close"]) > level
-            earlier = any(float(df.iloc[m]["close"]) > level for m in range(k + 1, i))
+            reclaimed = closes[i] > level
+            earlier = bool((closes[k + 1 : i] > level).any()) if k + 1 < i else False
         else:
-            broke = float(fake["high"]) > range_high or float(fake["close"]) > range_high
+            broke = highs[k] > range_high or closes[k] > range_high
             level = range_high
-            reclaimed = float(df.iloc[i]["close"]) < level
-            earlier = any(float(df.iloc[m]["close"]) < level for m in range(k + 1, i))
+            reclaimed = closes[i] < level
+            earlier = bool((closes[k + 1 : i] < level).any()) if k + 1 < i else False
         if not broke or earlier or not reclaimed:
             continue
+        fake = df.iloc[k]
         row = df.iloc[i]
         if not _finite(row["atr_14"]):
             continue
@@ -263,8 +322,14 @@ def detect_setups_on_bar(
     df1d: pd.DataFrame | None,
     regime: str | None,
     settings: dict,
+    *,
+    chart_only: bool = False,
 ) -> list[SetupCandidate]:
-    """Chart conditions plus regime and daily-bias eligibility for one closed 4H bar."""
+    """Chart conditions plus regime and daily-bias eligibility for one closed 4H bar.
+
+    `chart_only` skips regime, daily bias, and the minimum daily history count.
+    Callers that scan once and apply context at the trigger bar use that mode.
+    """
     found: list[SetupCandidate] = []
     daily_bars = 0 if df1d is None else len(df1d)
     row = df4h.iloc[j]
@@ -272,29 +337,37 @@ def detect_setups_on_bar(
         cfg = settings["setups"][setup]
         if not cfg.get("enabled", True):
             continue
-        if setup in (SETUP_SQUEEZE, SETUP_PULLBACK) and daily_bars < int(cfg["min_daily_bars"]):
+        if not chart_only and setup in (SETUP_SQUEEZE, SETUP_PULLBACK) and daily_bars < int(cfg["min_daily_bars"]):
             continue
         for direction in ("long", "short"):
-            if not direction_allowed(regime, setup, direction):
+            if not chart_only and not direction_allowed(regime, setup, direction):
                 continue
-            if setup == SETUP_MEME:
-                bias_required = daily_bars >= int(cfg["min_daily_bars_for_bias"])
-                bias_bars = int(cfg["min_daily_bars_for_bias"])
-            elif setup == SETUP_RECLAIM:
-                bias_required = False
-                bias_bars = int(settings["indicators"]["sma_slow"])
-            else:
-                bias_required = True
-                bias_bars = int(cfg["min_daily_bars"])
-            bias = daily_bias_ok(
-                df1d,
-                direction,
-                required=bias_required,
-                min_bars=bias_bars,
-                ema_column=ema_column(settings, "slow"),
-            )
-            if bias is False:
+            if (
+                not chart_only
+                and setup == SETUP_PULLBACK
+                and regime == CAUTION
+                and not bool(cfg.get("allow_caution", True))
+            ):
                 continue
+            if not chart_only:
+                if setup == SETUP_MEME:
+                    bias_required = daily_bars >= int(cfg["min_daily_bars_for_bias"])
+                    bias_bars = int(cfg["min_daily_bars_for_bias"])
+                elif setup == SETUP_RECLAIM:
+                    bias_required = False
+                    bias_bars = int(settings["indicators"]["sma_slow"])
+                else:
+                    bias_required = True
+                    bias_bars = int(cfg["min_daily_bars"])
+                bias = daily_bias_ok(
+                    df1d,
+                    direction,
+                    required=bias_required,
+                    min_bars=bias_bars,
+                    ema_column=ema_column(settings, "slow"),
+                )
+                if bias is False:
+                    continue
             hit = detector(df4h, j, direction, settings)
             if hit is None:
                 continue

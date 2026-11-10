@@ -50,6 +50,11 @@ setups:
     min_daily_bars: 200
     risk_pct: 0.02
     max_leverage: 3
+    # v0.3 pullback. Research variants override these; do not tighten from a short sample.
+    min_ema_gap_atr: 0.0
+    allow_caution: true
+    stop_swing_bars: 1
+    require_fast_ema_tag: false
   range_reclaim:
     enabled: true
     range_bars: 12
@@ -86,8 +91,15 @@ setups:
 exits:
   partial_at_r: 2.0
   partial_fraction: 0.5
+  # ema + immediate is the v0.3 4H trail (20 EMA and close, both ATR-buffered).
+  # chandelier and structure only tighten. trail_arm immediate | after_partial | after_1r.
+  trail_mode: ema
+  trail_arm: immediate
   trail_ema_atr_mult: 0.25
   trail_close_atr_mult: 1.5
+  chandelier_atr_mult: 2.0
+  structure_lookback: 3
+  structure_atr_buffer: 0.25
 
 risk:
   scale: 1.0

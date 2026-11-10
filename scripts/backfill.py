@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -19,11 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from desk.config import load_settings  # noqa: E402
+from desk.data.backfill_vision import backfill_vision_universe  # noqa: E402
 from desk.data.binance import BinancePublicClient, usdt_m_perpetuals  # noqa: E402
 from desk.data.store import Store  # noqa: E402
 from desk.data.sync import backfill_symbol, sync_exchange_info  # noqa: E402
 from desk.data.vision import iter_months, load_funding_month, load_klines_month  # noqa: E402
-from desk.timeutils import DAY_MS  # noqa: E402
+from desk.timeutils import DAY_MS, dt_to_ms  # noqa: E402
 
 # Months to probe for the first archived daily bar. This is not exchangeInfo.onboardDate.
 LISTING_PROBES = ("2019-09", "2020-01", "2020-09", "2021-01", "2021-09", "2022-01", "2023-01", "2024-01")
@@ -79,6 +81,20 @@ def _vision(store: Store, symbols: list[str], now_ms: int, days: int, daily_days
     session.close()
 
 
+def _month_start_ms(month: str) -> int:
+    year, mon = month.split("-")
+    return dt_to_ms(datetime(int(year), int(mon), 1, tzinfo=timezone.utc))
+
+
+def _previous_month(now_ms: int) -> str:
+    dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+    year, month = dt.year, dt.month - 1
+    if month == 0:
+        year -= 1
+        month = 12
+    return f"{year:04d}-{month:02d}"
+
+
 def _first_daily_open(session, symbol: str, timeout: float) -> int | None:
     for month in LISTING_PROBES:
         rows = load_klines_month(session, symbol, "1d", month, timeout)
@@ -95,6 +111,16 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=120, help="1h and 4h lookback")
     parser.add_argument("--daily-days", type=int, default=400, help="Daily lookback so the 200-day bias can be computed")
     parser.add_argument("--source", choices=("rest", "vision"), default="rest")
+    parser.add_argument("--start", default="2019-09", help="First vision month, YYYY-MM. Used with --all-universe")
+    parser.add_argument("--end", default="", help="Last vision month, YYYY-MM. Default: previous UTC month")
+    parser.add_argument("--workers", type=int, default=12, help="Parallel vision downloads")
+    parser.add_argument(
+        "--min-daily-quote-volume",
+        type=float,
+        default=500_000,
+        help="Keep symbols whose best UTC day is at least this quote volume (half of the 1M Setup D gate)",
+    )
+    parser.add_argument("--cache-dir", default=str(ROOT / "data" / "vision-cache"))
     args = parser.parse_args()
     settings = load_settings(args.settings)
     path = Path(settings["data"]["sqlite_path"])
@@ -105,8 +131,22 @@ def main() -> None:
     symbols = list(args.symbols)
     if args.source == "vision":
         if args.all_universe:
-            print("--all-universe needs exchangeInfo; it is not available from the vision archives", file=sys.stderr)
-            sys.exit(2)
+            end_month = args.end or _previous_month(now_ms)
+            start_ms = _month_start_ms(args.start)
+            end_ms = _month_start_ms(end_month)
+            backfill_vision_universe(
+                store,
+                cache_dir=Path(args.cache_dir),
+                start_ms=start_ms,
+                end_ms=end_ms,
+                now_ms=now_ms,
+                timeout=max(60.0, float(settings["data"]["request_timeout_seconds"])),
+                workers=max(1, args.workers),
+                min_daily_quote_volume=float(args.min_daily_quote_volume),
+            )
+            print(f"non-trading USDT-M rows stored: {store.count_non_trading()}")
+            store.close()
+            return
         _vision(store, symbols, now_ms, args.days, args.daily_days, float(settings["data"]["request_timeout_seconds"]))
         store.close()
         return

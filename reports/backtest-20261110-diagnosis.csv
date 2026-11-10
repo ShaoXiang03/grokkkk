@@ -1,0 +1,6 @@
+variant,family,setup,direction,sample,fold,trade_count,win_rate,expectancy,max_drawdown,sharpe,net_pnl
+ema_immediate_2r,diagnosis,trend_pullback,trail_stop,full,exit_reason,2869,,,,,
+ema_immediate_2r,diagnosis,trend_pullback,invalidation,full,exit_reason,169,,,,,
+ema_immediate_2r,diagnosis,trend_pullback,hard_stop,full,exit_reason,432,,,,,
+ema_immediate_2r,diagnosis,trend_pullback,time_stop,full,exit_reason,11,,,,,
+ema_immediate_2r,diagnosis,trend_pullback,end_of_data,full,exit_reason,4,,,,,

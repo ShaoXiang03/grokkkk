@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 from desk.backtest.costs import adverse_price, directional_pnl, slippage_fraction, taker_fee, tp1_price
@@ -18,13 +19,17 @@ from desk.backtest.walkforward import select_trades, walk_forward_folds
 from desk.indicators.core import add_indicators, ema_column
 from desk.rules.exits import (
     breakeven_stop,
+    chandelier_stop,
+    closed_structure_window,
     daily_bias_invalidated,
     invalidated,
     reached_one_r,
     stop_fill_price,
     stop_hit,
+    structure_stop,
     target_hit,
     time_stop_due,
+    trail_is_armed,
     trail_stop,
 )
 from desk.scanner.engine import evaluate_frame_at
@@ -68,6 +73,9 @@ class Position:
     hard_max_bars: int | None = None
     spread_frac: float = 0.0
     partial_fraction: float = 0.5
+    trail_extreme: float | None = None
+    mfe_r: float = 0.0
+    mae_r: float = 0.0
 
 
 def _week_key(ms: int):
@@ -113,8 +121,91 @@ def _funding_payment(pos: Position, rate: float, mark: float, ts: int) -> float:
     return cash
 
 
-def manage_bar(pos: Position, bar, row4h, row1d, settings: dict, ema_fast_col: str, ema_slow_col: str) -> str | None:
-    """Return an exit reason when the position is fully closed on this bar."""
+def _record_excursion(pos: Position, high: float, low: float) -> None:
+    risk = abs(pos.fill - pos.initial_stop)
+    if risk <= 0:
+        return
+    if pos.direction == "long":
+        pos.mfe_r = max(pos.mfe_r, (high - pos.fill) / risk)
+        pos.mae_r = max(pos.mae_r, (pos.fill - low) / risk)
+    else:
+        pos.mfe_r = max(pos.mfe_r, (pos.fill - low) / risk)
+        pos.mae_r = max(pos.mae_r, (high - pos.fill) / risk)
+
+
+def _apply_trail(pos: Position, row4h, settings: dict, ema_fast_col: str, recent_highs, recent_lows) -> None:
+    """Move the stop only in the trade's favor, and only after the configured arm."""
+    exits = settings["exits"]
+    arm = str(exits.get("trail_arm", "immediate"))
+    if not trail_is_armed(arm, partial_done=pos.partial_done, reached_1r=pos.reached_1r):
+        return
+    if not pd.notna(row4h.get("atr_14")):
+        return
+    atr = float(row4h["atr_14"])
+    if atr <= 0:
+        return
+    mode = str(exits.get("trail_mode", "ema"))
+    direction = pos.direction
+    if mode == "ema":
+        if not pd.notna(row4h.get(ema_fast_col)):
+            return
+        pos.stop = trail_stop(
+            pos.stop,
+            direction,
+            float(row4h[ema_fast_col]),
+            atr,
+            float(row4h["close"]),
+            float(exits["trail_ema_atr_mult"]),
+            float(exits["trail_close_atr_mult"]),
+        )
+        return
+    if mode == "chandelier":
+        high = float(row4h["high"])
+        low = float(row4h["low"])
+        if direction == "long":
+            pos.trail_extreme = high if pos.trail_extreme is None else max(pos.trail_extreme, high)
+        else:
+            pos.trail_extreme = low if pos.trail_extreme is None else min(pos.trail_extreme, low)
+        pos.stop = chandelier_stop(
+            pos.stop,
+            direction,
+            pos.trail_extreme,
+            atr,
+            float(exits.get("chandelier_atr_mult", 2.0)),
+        )
+        return
+    if mode == "structure":
+        highs = list(recent_highs or [float(row4h["high"])])
+        lows = list(recent_lows or [float(row4h["low"])])
+        pos.stop = structure_stop(
+            pos.stop,
+            direction,
+            highs,
+            lows,
+            atr,
+            float(exits.get("structure_atr_buffer", 0.25)),
+        )
+        return
+    raise ValueError(f"unknown trail_mode {mode}")
+
+
+def manage_bar(
+    pos: Position,
+    bar,
+    row4h,
+    row1d,
+    settings: dict,
+    ema_fast_col: str,
+    ema_slow_col: str,
+    recent_highs=None,
+    recent_lows=None,
+) -> str | None:
+    """Return an exit reason when the position is fully closed on this bar.
+
+    The stop is tested before the target. A trail update on this 4H close
+    applies to later bars only, so the current bar's own extreme is not used
+    as a fill on this bar.
+    """
     direction = pos.direction
     fee = float(settings["costs"]["taker_fee_rate"])
     slip = _slip(settings, pos.spread_frac)
@@ -127,9 +218,12 @@ def manage_bar(pos: Position, bar, row4h, row1d, settings: dict, ema_fast_col: s
     if stop_hit(direction, pos.stop, high, low):
         raw = stop_fill_price(direction, pos.stop, open_)
         price = _market_exit_price(direction, raw, slip)
+        _record_excursion(pos, price, price)
         reason = "hard_stop" if abs(pos.stop - pos.initial_stop) <= 1e-9 else "trail_stop"
         _close_qty(pos, pos.remaining, price, ts, fee)
         return reason
+
+    _record_excursion(pos, high, low)
 
     if not pos.partial_done and target_hit(direction, pos.tp1, high, low):
         qty = pos.size * pos.partial_fraction
@@ -159,19 +253,33 @@ def manage_bar(pos: Position, bar, row4h, row1d, settings: dict, ema_fast_col: s
             price = _market_exit_price(direction, close, slip)
             _close_qty(pos, pos.remaining, price, ts, fee)
             return reason
-        if pd.notna(row4h.get("atr_14")) and pd.notna(row4h.get(ema_fast_col)):
-            atr = float(row4h["atr_14"])
-            ema_fast_value = float(row4h[ema_fast_col])
-            pos.stop = trail_stop(
-                pos.stop,
-                direction,
-                ema_fast_value,
-                atr,
-                float(row4h["close"]),
-                float(settings["exits"]["trail_ema_atr_mult"]),
-                float(settings["exits"]["trail_close_atr_mult"]),
-            )
+        _apply_trail(pos, row4h, settings, ema_fast_col, recent_highs, recent_lows)
     return None
+
+
+def _historical_status(meta: dict) -> str:
+    """A stored bar means the contract was listed then, including names later delisted.
+
+    The catalog status stays on the symbol row and is counted as delisted. The
+    product gate sees TRADING for USDT-M perpetuals while their klines exist.
+    """
+    contract = str(meta.get("contract_type") or "PERPETUAL").upper()
+    quote = str(meta.get("quote_asset") or "USDT").upper()
+    if contract == "PERPETUAL" and quote == "USDT":
+        return "TRADING"
+    return str(meta.get("status") or "")
+
+
+def _structure_arrays(df4h: pd.DataFrame, open_time: int, settings: dict) -> tuple[list[float], list[float]]:
+    opens = df4h["open_time"].to_numpy()
+    index = int(np.searchsorted(opens, int(open_time), side="right") - 1)
+    lookback = int(settings["exits"].get("structure_lookback", 3))
+    return closed_structure_window(
+        df4h["high"].astype(float).tolist(),
+        df4h["low"].astype(float).tolist(),
+        index,
+        lookback,
+    )
 
 
 def _row_at(df: pd.DataFrame | None, open_time: int):
@@ -200,6 +308,8 @@ def _finished_trade(pos: Position, exit_time: int, exit_reason: str) -> dict:
         "fees": pos.fees,
         "funding": pos.funding,
         "partial_taken": pos.partial_done,
+        "mfe_r": pos.mfe_r,
+        "mae_r": pos.mae_r,
         "flows": list(pos.flows),
     }
 
@@ -339,11 +449,18 @@ def run_backtest(
             if pos is not None and pos.entry_index < idx:
                 row4h = None
                 row1d = None
+                recent_highs = None
+                recent_lows = None
                 if open_time % H4_MS == 3 * HOUR_MS:
-                    row4h = _row_at(blob["4h"], open_time - 3 * HOUR_MS)
+                    h4_open = open_time - 3 * HOUR_MS
+                    row4h = _row_at(blob["4h"], h4_open)
+                    if row4h is not None and str(settings["exits"].get("trail_mode", "ema")) == "structure":
+                        recent_highs, recent_lows = _structure_arrays(blob["4h"], h4_open, settings)
                 if open_time % DAY_MS == 23 * HOUR_MS:
                     row1d = _row_at(blob["1d"], open_time - 23 * HOUR_MS)
-                reason = manage_bar(pos, bar, row4h, row1d, settings, ema_fast, ema_slow)
+                reason = manage_bar(
+                    pos, bar, row4h, row1d, settings, ema_fast, ema_slow, recent_highs, recent_lows
+                )
                 if reason is None and pos.remaining > 1e-12:
                     _apply_due_funding(pos, blob["funding"], prev_close, bar_close, float(bar["close"]))
                 if reason is not None or pos.remaining <= 1e-12:
@@ -401,11 +518,12 @@ def run_backtest(
             meta = blob["meta"]
             market = {
                 "symbol": symbol,
-                "status": meta.get("status", "TRADING"),
+                "status": _historical_status(meta),
                 "contract_type": meta.get("contract_type", "PERPETUAL"),
                 "quote_asset": meta.get("quote_asset", "USDT"),
                 "base_asset": meta.get("base_asset"),
                 "onboard_date_ms": meta.get("onboard_date_ms"),
+                "catalog_status": meta.get("status", "TRADING"),
                 "bid": None,
                 "ask": None,
                 "funding_rate": _funding_as_of(blob["funding"], any_close),
