@@ -5,13 +5,14 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from desk.config import assert_no_live_orders, load_settings
+from desk.config import assert_no_live_orders
 from desk.data.binance import BinancePublicClient
 from desk.data.store import Store
 from desk.data.sync import backfill_symbol, sync_exchange_info, sync_live_quotes
+from desk.delivery.outbox import drain_outbox, enqueue_packet
+from desk.journal.decision import DecisionJournal
 from desk.journal.log import record
 from desk.scanner.engine import evaluate_frame_at
-from desk.scanner.webhook import send_packet
 from desk.timeutils import DAY_MS
 
 
@@ -34,14 +35,25 @@ def account_from_settings(settings: dict) -> dict:
     }
 
 
-def scan_once(settings: dict, store: Store, *, symbols: list[str] | None = None, now_ms: int | None = None) -> list[dict]:
+def scan_once(
+    settings: dict,
+    store: Store,
+    *,
+    symbols: list[str] | None = None,
+    now_ms: int | None = None,
+    account: dict | None = None,
+    open_positions: list[dict] | None = None,
+    onchain_raw: dict | None = None,
+) -> list[dict]:
     assert_no_live_orders(settings)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     chosen = symbols or settings["data"].get("symbols") or []
     if not chosen:
         chosen = [row["symbol"] for row in store.list_symbols(trading_only=True)]
     btc = store.klines("BTCUSDT", "1d")
-    account = account_from_settings(settings)
+    account = account_from_settings(settings) if account is None else account
+    positions = list(open_positions or [])
+    journal = DecisionJournal(store, settings)
     blocked = set(settings["blocklist"].get("symbols") or []) | store.blocklist_symbols()
     available = bool(settings["blocklist"].get("available", True))
     packets: list[dict] = []
@@ -83,22 +95,26 @@ def scan_once(settings: dict, store: Store, *, symbols: list[str] | None = None,
             settings=settings,
             market=market,
             account=account,
-            open_positions=[],
+            open_positions=positions,
             cooldown_until_ms=store.cooldown_until(symbol),
             blocklist_symbols=blocked,
             blocklist_available=available,
-            onchain_raw=None,
+            onchain_raw=onchain_raw,
             historical=False,
         )
         for packet in found:
             if store.has_signal(packet["signal_id"]) or store.has_dedupe(packet["dedupe_key"]):
                 continue
             store.save_signal(packet)
+            journal.record_signal(packet, now)
             record(store, now, "signal", {"signal_id": packet["signal_id"], "status": packet["status"]})
             if settings["webhook"].get("enabled"):
-                result = send_packet(packet, settings)
-                record(store, now, "webhook", {"signal_id": packet["signal_id"], **result})
+                queued = enqueue_packet(store, packet, settings, now)
+                record(store, now, "webhook_enqueue", {"signal_id": packet["signal_id"], **queued})
             packets.append(packet)
+    if settings["webhook"].get("enabled"):
+        for outcome in drain_outbox(store, settings, now):
+            record(store, now, "webhook", outcome)
     return packets
 
 

@@ -1,1 +1,1 @@
-"""Local journal of packets. This is a log, not an order path."""
+"""Append-only decision journal. This is a log, not an order path."""

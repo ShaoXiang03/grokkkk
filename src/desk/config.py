@@ -154,9 +154,32 @@ def default_settings() -> dict[str, Any]:
             "enabled": False,
             "url": "",
             "timeout_seconds": 5,
-            "max_retries": 3,
+            "max_retries": 5,
+            "retry_backoff_seconds": 1,
+            "retry_backoff_max_seconds": 60,
             "secret_env": "WEBHOOK_SECRET",
+            "require_signature": True,
+            "signature_max_age_seconds": 300,
             "send_rejects": False,
+        },
+        "decision": {
+            "timeout_seconds": 3600,
+            # Read by nothing that can open a trade. The timeout is always skip.
+            "timeout_action": "skip",
+        },
+        "review": {
+            "listen": "",
+            "secret_env": "REVIEW_SECRET",
+        },
+        "paper": {
+            "initial_equity": 800,
+            "clock_days": 14,
+            "max_data_age_seconds": 5400,
+            "kill_switch_path": "data/KILL",
+            "loop_seconds": 60,
+        },
+        "journal": {
+            "jsonl_path": "data/journal.jsonl",
         },
         "data": {
             "sqlite_path": "data/desk.sqlite",

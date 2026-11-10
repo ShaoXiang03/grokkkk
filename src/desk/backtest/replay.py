@@ -107,6 +107,7 @@ def _close_qty(pos: Position, qty: float, price: float, ts: int, fee_rate: float
     pos.realized += net
     pos.flows.append((ts, net))
     pos.remaining -= qty
+    pos.meta["last_fill_price"] = price
     return net
 
 
@@ -672,6 +673,36 @@ def run_backtest(
             "This process never places orders.",
         ],
     }
+
+
+def simulate_entry(packet: dict, bar_index: int, settings: dict) -> Position | None:
+    """Fill one packet with this module's fee and slippage. The paper loop uses it."""
+    return _open_from_packet(packet, bar_index, settings)
+
+
+def apply_funding_between(pos: Position, funding, prev_close: int, bar_close: int, mark: float) -> None:
+    _apply_due_funding(pos, funding, prev_close, bar_close, mark)
+
+
+def trade_record(pos: Position, exit_time: int, exit_reason: str) -> dict:
+    trade = _finished_trade(pos, exit_time, exit_reason)
+    price = pos.meta.get("last_fill_price")
+    if price is not None:
+        trade["exit_price"] = price
+    return trade
+
+
+def position_risk_usdt(pos: Position) -> float:
+    return _live_risk(pos)
+
+
+def force_exit(pos: Position, raw_price: float, ts: int, settings: dict, reason: str) -> dict:
+    """Market out the remaining size. Slippage and the taker fee match manage_bar."""
+    slip = _slip(settings, pos.spread_frac)
+    price = _market_exit_price(pos.direction, raw_price, slip)
+    fee = float(settings["costs"]["taker_fee_rate"])
+    _close_qty(pos, pos.remaining, price, ts, fee)
+    return trade_record(pos, ts, reason)
 
 
 def _funding_as_of(funding: pd.DataFrame | None, ts: int) -> float | None:

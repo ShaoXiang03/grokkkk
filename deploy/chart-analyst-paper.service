@@ -1,0 +1,26 @@
+[Unit]
+Description=Chart Analyst paper engine (public data, simulated fills, no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Create this user. Do not run the paper loop as root.
+User=chartanalyst
+Group=chartanalyst
+WorkingDirectory=/opt/chart-analyst
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/chart-analyst/secrets.env
+ExecStart=/opt/chart-analyst/.venv/bin/python scripts/run_paper.py --loop --refresh --serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+# journald keeps stdout. To also write a file, replace the next two lines with:
+# StandardOutput=append:/var/log/chart-analyst/paper.log
+# StandardError=append:/var/log/chart-analyst/paper.log
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
