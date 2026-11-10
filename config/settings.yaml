@@ -199,3 +199,21 @@ backtest:
   walk_forward_in_sample_days: 182
   walk_forward_out_sample_days: 91
   close_at_end: true
+
+# E1–E6 research books. The 4h scanner does not emit them and this build
+# still has no order path. A book is enabled only when its frozen variant's
+# 2025-01..2026-10 hold-out finished above the start after fees, slippage,
+# and funding. Otherwise it stays off.
+strategies:
+  e1_cs_momentum:
+    enabled: false
+  e2_residual_momentum:
+    enabled: false
+  e3_slow_trend:
+    enabled: false
+  e4_funding_carry:
+    enabled: false
+  e5_positioning_trend:
+    enabled: false
+  e6_liquidation_proxy:
+    enabled: false

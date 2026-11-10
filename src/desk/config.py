@@ -200,6 +200,16 @@ def default_settings() -> dict[str, Any]:
             "walk_forward_out_sample_days": 91,
             "close_at_end": True,
         },
+        # Research books. The 4h scanner does not emit these. enabled is set
+        # only after a positive 2025-01..2026-10 hold-out, net of costs.
+        "strategies": {
+            "e1_cs_momentum": {"enabled": False},
+            "e2_residual_momentum": {"enabled": False},
+            "e3_slow_trend": {"enabled": False},
+            "e4_funding_carry": {"enabled": False},
+            "e5_positioning_trend": {"enabled": False},
+            "e6_liquidation_proxy": {"enabled": False},
+        },
     }
 
 
