@@ -1,0 +1,25 @@
+[Unit]
+Description=Chart Analyst monitoring dashboard (read-only, no orders)
+After=network-online.target chart-analyst-paper.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Same user as the paper loop so it can read the sqlite file and the WAL index.
+User=chartanalyst
+Group=chartanalyst
+WorkingDirectory=/opt/chart-analyst
+Environment=PYTHONUNBUFFERED=1
+# Webhook and review secrets are not inputs. Do not point this unit at an env file.
+ExecStart=/opt/chart-analyst/.venv/bin/python scripts/serve_dashboard.py --listen 127.0.0.1:8788
+Nice=10
+MemoryMax=512M
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

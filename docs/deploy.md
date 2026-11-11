@@ -232,3 +232,16 @@ Setup D stays ineligible until an on-chain source fills the six scanner checks. 
 - Do not add an order client, a futures API key, or a withdrawal key.
 - Do not turn E6, E1, E4, E5, or the v0.3 setups back on from a short paper sample. E6's hold-out was 11 trades. The v0.3 full-universe study did not show an out-of-sample edge.
 - Do not treat the paper scorecard as a fresh out-of-sample test. The drift band compares the live book with the 2025–26 hold-out rates that were already used to switch E2 and E3 on.
+
+## Dashboard
+
+The monitoring page is a second unit. It does not replace this one and it does not load `secrets.env`. Install and tunnel steps are in `docs/dashboard.md`.
+
+```bash
+sudo cp deploy/chart-analyst-dashboard.service /etc/systemd/system/chart-analyst-dashboard.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now chart-analyst-dashboard.service
+ssh -L 8788:127.0.0.1:8788 <you>@<server>
+```
+
+Then open `http://127.0.0.1:8788/` on your machine. The dashboard listens on `127.0.0.1:8788`.

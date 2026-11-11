@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from desk.config import assert_no_live_orders, load_settings  # noqa: E402
+from desk.dashboard.refresh_status import RefreshObserver  # noqa: E402
 from desk.data.paper_refresh import PaperRefresh, due_daily_symbols  # noqa: E402
 from desk.delivery.http import serve_review  # noqa: E402
 from desk.paper.engine import review_account, run_cycle  # noqa: E402
@@ -71,7 +72,9 @@ def main() -> None:
     elif args.serve:
         logging.warning("review.listen is empty; the paper loop will run without the review endpoint")
 
-    refresher = PaperRefresh(settings) if args.refresh else None
+    # Counters only, and only while --refresh is on. A failed write does not change the slice.
+    observer = RefreshObserver.from_settings(settings) if args.refresh else None
+    refresher = PaperRefresh(settings, on_summary=observer.observe) if observer is not None else None
 
     def symbol_source() -> list[str]:
         if symbols:

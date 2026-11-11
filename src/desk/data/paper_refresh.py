@@ -97,6 +97,7 @@ class PaperRefresh:
         kline_fetch=None,
         sleep=None,
         session=None,
+        on_summary=None,
     ):
         self.settings = settings
         self.budget = budget if budget is not None else WeightBudget.from_settings(settings)
@@ -104,6 +105,7 @@ class PaperRefresh:
         self.kline_fetch = kline_fetch
         self.sleep = sleep if sleep is not None else time.sleep
         self._session = session
+        self.on_summary = on_summary
         self.cursor = 0
         self._retry_after: dict[tuple, int] = {}
         self._stop = threading.Event()
@@ -193,6 +195,7 @@ class PaperRefresh:
             "pending": 0,
         }
         if not symbols:
+            self._emit(summary)
             return summary
         started = time.monotonic()
         opens = store.latest_opens("1d")
@@ -234,6 +237,7 @@ class PaperRefresh:
             if not allowed and self._needs_fapi(store, opens, symbols, now_ms):
                 summary["paused"] = True
                 summary["pause_reason"] = reason
+        self._emit(summary)
         return summary
 
     def _pending(self, opens: dict[str, int], symbols: list[str], now_ms: int) -> int:
@@ -538,6 +542,15 @@ class PaperRefresh:
                 int(now_ms),
             )
         logging.info("paper refresh marked %s DELISTED; vision and fapi have no newer daily bar", symbol)
+
+    def _emit(self, summary: dict) -> None:
+        callback = self.on_summary
+        if callback is None:
+            return
+        try:
+            callback(summary)
+        except Exception:
+            logging.exception("paper refresh status observer failed")
 
     def _client(self):
         if self.client is not None:

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex">
+  <title>Chart Analyst desk</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <div>
+        <strong>Chart Analyst</strong>
+        <span class="sub">paper desk</span>
+      </div>
+    </div>
+    <div class="clock-block">
+      <div id="clock-line">Loading the paper clock…</div>
+      <div class="meter slim" aria-hidden="true"><span id="clock-fill"></span></div>
+    </div>
+    <div class="header-side">
+      <div id="pills"></div>
+      <div class="refresh-line">
+        <span id="age">waiting</span>
+        <label class="pause"><input id="pause" type="checkbox"> Pause page refresh</label>
+      </div>
+    </div>
+  </header>
+  <nav id="nav">
+    <button type="button" data-view="health" class="active">Health</button>
+    <button type="button" data-view="books">Books</button>
+    <button type="button" data-view="signals">Signals</button>
+    <button type="button" data-view="journal">Journal</button>
+    <button type="button" data-view="scorecard">Scorecard</button>
+  </nav>
+  <div id="banner" hidden></div>
+  <main id="main"></main>
+  <footer>
+    Read-only. This page cannot place orders, change config, approve signals, or touch the kill switch.
+  </footer>
+  <div id="auth" hidden>
+    <div class="auth-card">
+      <h2>Read token</h2>
+      <p>This dashboard is asking for its access token. The token stays in this browser tab and is not written to the desk.</p>
+      <input id="token" type="password" autocomplete="current-password" placeholder="DASHBOARD_TOKEN">
+      <button type="button" id="token-save">Unlock</button>
+      <p id="auth-error" class="down"></p>
+    </div>
+  </div>
+  <noscript>This dashboard needs JavaScript to draw the read-only view. It still cannot place orders.</noscript>
+  <script src="/app.js"></script>
+</body>
+</html>

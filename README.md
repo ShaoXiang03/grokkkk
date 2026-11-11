@@ -21,6 +21,7 @@ The working partial is **50% at 2R**. `exits.partial_at_r` can be set to `1.0` t
 | `src/desk/paper/` | Simulated fills, kill switch, 14-day clock, scorecard. No order client. |
 | `src/desk/backtest/` | Same evaluation path, costs, metrics, walk-forward split. |
 | `docs/deploy.md` | systemd, env file, log rotation. |
+| `docs/dashboard.md` | Read-only monitoring dashboard on `127.0.0.1:8788`. |
 | `scripts/` | Backfill, scanner, backtest, paper, review, export, outbox drain. |
 
 `src/desk/execution/` is absent on purpose. There is no order placement. A new setup becomes eligible by emitting a packet whose hard gates pass; the webhook, journal, and paper loop do not need a code change for that.
@@ -172,6 +173,16 @@ The loop evaluates closed bars, enqueues proposed packets, and simulates a fill 
 Paper equity is the local ledger, starting at `paper.initial_equity`. This process cannot read exchange equity. There is no account endpoint and no API key. `docs/deploy.md` is the server runbook.
 
 The committed `account.news_status` is null, so an `open` is refused until you set `ALLOW` yourself. Setup D stays refused while its on-chain checks are `MISSING`.
+
+## Monitoring dashboard
+
+A separate read-only process serves the desk on `127.0.0.1:8788`. It does not place orders or attach reviews. From a checkout with the package installed:
+
+```bash
+python3 scripts/serve_dashboard.py
+```
+
+On the server, install `deploy/chart-analyst-dashboard.service` and open it through an SSH tunnel. The steps, the unit limits, and the optional authenticated bind are in `docs/dashboard.md`.
 
 ## What is still not in this repo
 
