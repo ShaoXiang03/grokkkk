@@ -28,6 +28,7 @@ from desk.indicators.core import add_indicators, ema_column
 from desk.journal.decision import DecisionJournal
 from desk.paper.books import book_contribution, fill_books, propose_books, reduce_books
 from desk.paper.clock import myt_week_key
+from desk.paper.freshness import daily_only, data_is_fresh, setups_enabled
 from desk.paper.scorecard import build_scorecard, note_drift
 from desk.paper.state import dump_position, load_position
 from desk.rules.risk_gates import _as_float
@@ -60,25 +61,14 @@ def cycle_symbols(settings: dict, store, symbols: list[str] | None) -> list[str]
     configured = list(settings["data"].get("symbols") or [])
     if configured:
         return configured
+    # Daily books read every stored daily name. The 1h cache is the setup path.
+    if daily_only(settings):
+        from desk.data.paper_refresh import due_daily_symbols
+
+        found = due_daily_symbols(store)
+        if found:
+            return found
     return store.symbols_with_interval("1h")
-
-
-def data_is_fresh(store, symbols: list[str], now_ms: int, settings: dict) -> tuple[bool, str]:
-    if not symbols:
-        return False, "no symbols to check"
-    max_age = int(settings["paper"]["max_data_age_seconds"]) * 1000
-    stale = []
-    for symbol in symbols:
-        frame = store.klines(symbol, "1h", end_ms=now_ms)
-        if frame.empty:
-            stale.append(symbol)
-            continue
-        close_time = int(frame.iloc[-1]["close_time"])
-        if int(now_ms) - close_time > max_age:
-            stale.append(symbol)
-    if stale:
-        return False, "stale or missing closed 1h bars: " + ",".join(stale)
-    return True, "closed 1h bars are fresh"
 
 
 def ensure_paper_account(store, settings: dict, now_ms: int) -> dict:
@@ -460,15 +450,18 @@ def run_cycle(
                 "weekly_pnl_pct": snapshot["weekly_pnl_pct"],
                 "news_status": snapshot["news_status"],
             }
-            scanned = scan_once(
-                settings,
-                store,
-                symbols=chosen,
-                now_ms=now_ms,
-                account=account,
-                open_positions=list(snapshot["open_positions"]),
-                onchain_raw=onchain_raw,
-            )
+            # E2/E3 do not read 1h bars. Scanning the daily universe as if it
+            # were a setup tape just loads empty frames.
+            if setups_enabled(settings):
+                scanned = scan_once(
+                    settings,
+                    store,
+                    symbols=chosen,
+                    now_ms=now_ms,
+                    account=account,
+                    open_positions=list(snapshot["open_positions"]),
+                    onchain_raw=onchain_raw,
+                )
             snapshot = marked_equity(store, settings, now_ms) or snapshot
             proposed = propose_books(settings, store, now_ms, journal, snapshot)
             snapshot = marked_equity(store, settings, now_ms) or snapshot

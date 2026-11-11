@@ -295,8 +295,9 @@ def test_risk_reducing_exit_is_not_blocked_by_a_gate_a_skip_or_the_cap(tmp_path)
     settings["account"]["news_status"] = None
     store = Store(tmp_path / "desk.sqlite")
     _panel(store, day_ms)
-    now = int(day_ms[decision_i] + DAY_MS + 60_000)
-    # No 1h bar: the entry path is stale. The stop still has its daily close.
+    # The panel's last daily close is already behind this clock, so new entries
+    # are stale. The stop still has the daily bars in the store.
+    now = int(day_ms[-1] + 2 * DAY_MS + 120_000)
     held = BookPosition(
         book="e2",
         symbol="N01USDT",

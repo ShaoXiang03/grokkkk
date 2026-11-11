@@ -170,8 +170,12 @@ review:
 paper:
   initial_equity: 800
   clock_days: 14
-  # A closed 1H bar older than this blocks new entries. It does not block
-  # a risk-reducing exit or stop that already has a closed daily bar.
+  # Slack on a bar's close timestamp, in seconds. Intraday setups still
+  # fail closed when the latest closed 1h bar is older than this (90 minutes).
+  # E2 and E3 are daily-close books: they fail closed when the daily bar that
+  # closed at the last 00:00 UTC is missing. This value does not turn that
+  # into a 90-minute horizon. A stop on a daily bar already in the store is
+  # not blocked either way.
   max_data_age_seconds: 5400
   kill_switch_path: data/KILL
   loop_seconds: 60
@@ -192,6 +196,14 @@ data:
   request_timeout_seconds: 20
   request_pause_seconds: 0.25
   kline_limit: 1500
+  # fapi request weight this process may spend per rolling minute.
+  # Binance's per-IP limit is 2400. This host shares that IP with live
+  # trading. Do not raise this to make the paper loop catch up faster.
+  # The code clamps anything above 600.
+  request_weight_per_minute: 300
+  # When X-MBX-USED-WEIGHT-1M is above this, other callers are busy.
+  # The paper refresh stops calling fapi until the minute turns over.
+  used_weight_pause: 1200
   # Empty means "whatever is already in the local store".
   symbols: []
 
