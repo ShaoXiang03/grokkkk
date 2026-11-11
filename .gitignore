@@ -17,6 +17,7 @@ data/*.sqlite-wal
 data/*.db
 data/*.jsonl
 data/KILL
+data/refresh_status.json
 reports/*
 !reports/backtest-*.md
 !reports/backtest-*.csv
