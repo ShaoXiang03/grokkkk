@@ -308,6 +308,28 @@ class Store:
         self.conn.commit()
         return len(rows)
 
+    def latest_opens(self, interval: str) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT symbol, MAX(open_time) AS t FROM klines WHERE interval = ? GROUP BY symbol",
+            (interval,),
+        )
+        return {row["symbol"]: int(row["t"]) for row in rows if row["t"] is not None}
+
+    def latest_close_time(self, symbol: str, interval: str, end_ms: int | None = None) -> int | None:
+        if end_ms is None:
+            row = self.conn.execute(
+                "SELECT MAX(close_time) AS t FROM klines WHERE symbol = ? AND interval = ?",
+                (symbol, interval),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT MAX(close_time) AS t FROM klines WHERE symbol = ? AND interval = ? AND close_time <= ?",
+                (symbol, interval, int(end_ms)),
+            ).fetchone()
+        if row is None or row["t"] is None:
+            return None
+        return int(row["t"])
+
     def latest_open_time(self, symbol: str, interval: str) -> int | None:
         row = self.conn.execute(
             "SELECT MAX(open_time) AS t FROM klines WHERE symbol = ? AND interval = ?",
@@ -349,6 +371,15 @@ class Store:
             ],
         )
         self.conn.commit()
+
+    def latest_funding_time(self, symbol: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT MAX(funding_time) AS t FROM funding WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        if row is None or row["t"] is None:
+            return None
+        return int(row["t"])
 
     def funding(self, symbol: str) -> pd.DataFrame:
         return pd.read_sql_query(
@@ -621,6 +652,13 @@ class Store:
             ],
         )
         self.conn.commit()
+
+    def vision_day_rows(self, symbol: str, dataset: str, day: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT rows FROM vision_days WHERE symbol = ? AND dataset = ? AND day = ?",
+            (symbol, dataset, day),
+        ).fetchone()
+        return None if row is None else int(row["rows"])
 
     def vision_day_done(self, symbol: str, dataset: str) -> set[str]:
         rows = self.conn.execute(

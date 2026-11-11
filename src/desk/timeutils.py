@@ -49,6 +49,21 @@ def interval_ms(interval: str) -> int:
     return {"1h": HOUR_MS, "4h": H4_MS, "1d": DAY_MS}[interval]
 
 
+def floor_day_ms(ms: int) -> int:
+    ms = int(ms)
+    return ms - (ms % DAY_MS)
+
+
+def last_closed_daily_open(now_ms: int) -> int:
+    """Open time of the daily bar that has already closed.
+
+    A daily bar opens at 00:00 UTC and closes at the next 00:00 UTC.
+    At 15:00 UTC the bar that opened yesterday has closed. At exactly
+    00:00 UTC that same bar has just closed.
+    """
+    return floor_day_ms(now_ms) - DAY_MS
+
+
 def iso_in(ms: int, hours: float) -> str:
     return ms_to_utc_iso(ms + int(hours * HOUR_MS))
 

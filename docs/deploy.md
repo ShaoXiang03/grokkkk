@@ -40,7 +40,9 @@ Do these on the server. The process still has no order path, so none of these st
    sudo -u chartanalyst .venv/bin/python scripts/backfill_research.py
    ```
 
-   `backfill_research.py` pulls funding, premium, and open interest from the public archive. If `fapi.binance.com` answers, a REST backfill is the same public market data. A missing open-interest print does not drop a name. A missing daily bar does.
+   `backfill_research.py` pulls funding, premium, and open interest from the public archive. A missing open-interest print does not drop a name. A missing daily bar does.
+
+   The running loop fills the days after `--end` itself, from vision daily files, and calls `fapi.binance.com` only for a day the archive does not have yet. Do not run `scripts/backfill.py --source rest --all-universe` on this host. That spends the IP weight the live bots also use.
 5. Set `account.news_status: ALLOW` only if you accept that this host is not connected to News Watcher. Until you do, every new entry is rejected. Stops and other exits still run.
 6. Fill `/etc/chart-analyst/secrets.env` with `WEBHOOK_URL`, `WEBHOOK_SECRET`, and `REVIEW_SECRET`. No exchange key goes in that file. Lock it to `root:chartanalyst` mode `640`.
 7. Set `review.listen` to `127.0.0.1:8787` and restart the unit (`systemctl restart chart-analyst-paper.service`). The review port stays on loopback.
@@ -105,7 +107,26 @@ sudo systemctl status chart-analyst-paper.service
 journalctl -u chart-analyst-paper -f
 ```
 
-The unit runs `scripts/run_paper.py --loop --refresh --serve`. `--refresh` pulls public klines, funding, and the book. `--serve` listens only if `review.listen` is set, and it should be loopback:
+The unit runs:
+
+```bash
+/opt/chart-analyst/.venv/bin/python scripts/run_paper.py --loop --refresh --serve
+```
+
+That is the `ExecStart` in `deploy/chart-analyst-paper.service`. `--serve` listens only if `review.listen` is set, and it should be loopback.
+
+`--refresh` is not a bulk pull of the USDT-M universe from `fapi.binance.com`. E2 and E3 need the daily close, so the refresh:
+
+- reads the names already in the local store (it does not call `exchangeInfo`)
+- downloads each missing UTC day from `data.binance.vision` daily kline files, which are not on the fapi IP-weight limit
+- calls fapi `GET /fapi/v1/klines` only for the last day or two, when the vision file is not there yet, one symbol at a time, continuing from the last stored open
+- does not download daily funding files. Vision does not publish those for USD-M. A name with an open paper position gets one fapi `fundingRate` request (weight 1) under the same budget, continuing from the last stored print. The monthly archive remains the history
+
+The fapi budget is `data.request_weight_per_minute` in `config/settings.yaml`. The shipped value is **300 weight per rolling minute**. Binance's per-IP limit is 2400. This host shares that IP with live trading, so do not raise 300 to make a catch-up faster. If the setting is above 600, the process clamps it to 600. Kline requests in this refresh use `limit` below 100, which Binance bills as weight 1. A full-universe ticker call (weight 40) is not used.
+
+`data.used_weight_pause` defaults to **1200**. After every fapi response the process reads `X-MBX-USED-WEIGHT-1M`. Above 1200 it stops calling fapi until that minute window has passed, because something else on the IP is already busy. HTTP 429 and 418 do the same with `Retry-After` (a missing header still pauses: 2 minutes for 429, 15 minutes for 418). The refresh does not retry in a loop. The process stays up. The next paper cycle still runs, including stops.
+
+The refresh runs beside the cycle, not in front of it. A slow download or a paused fapi does not delay a risk-reducing exit, and it does not crash the unit. New entries stay blocked until the daily bars are current. Once the store is caught up, a quiet minute sends no fapi requests at all.
 
 ```yaml
 review:
@@ -142,9 +163,9 @@ cd /opt/chart-analyst
 sudo -u chartanalyst .venv/bin/python scripts/backfill.py --symbols BTCUSDT ETHUSDT SOLUSDT --days 120 --daily-days 400
 ```
 
-If the host gets HTTP 451 from `fapi.binance.com`, use `--source vision` as described in the README. Vision is still public market data.
+If the host gets HTTP 451 from `fapi.binance.com`, the refresh pauses fapi and keeps using vision. The historical load is the vision command in the checklist. Vision is still public market data. Do not point a full-universe REST backfill at this IP.
 
-One cycle, then the scorecard:
+One cycle, then the scorecard. `--once --refresh` uses the same 300 weight/minute cap. It does not walk the whole universe on fapi:
 
 ```bash
 sudo -u chartanalyst .venv/bin/python scripts/run_paper.py --once --refresh --symbols BTCUSDT ETHUSDT
@@ -190,7 +211,8 @@ The default path is `paper.kill_switch_path` (`data/KILL`). `KILL_SWITCH_PATH` i
 
 New entries are not simulated when any of these are true:
 
-- the latest closed 1h bar is older than `paper.max_data_age_seconds` (default 90 minutes)
+- an enabled intraday setup's latest closed 1h bar is older than `paper.max_data_age_seconds` (default 90 minutes)
+- E2 or E3 is on, intraday setups are off, and a still-listed name is missing the daily bar that closed at the last 00:00 UTC. `paper.max_data_age_seconds` is only slack for that close timestamp. A daily bar from the previous month is stale. A bar that closed at today's 00:00 UTC stays fresh until the next close. A name the archive marked `DELISTED` is not part of this check
 - paper equity or the daily or weekly P&L cannot be computed from the local ledger
 - `account.news_status` is missing or is not `ALLOW`
 - open risk, cluster risk, or the per-name notional cap would be exceeded across E2, E3, and any leftover setup position
@@ -198,7 +220,7 @@ New entries are not simulated when any of these are true:
 - the kill-switch file exists
 - the decision is missing, late, or has no reasoning on an open
 
-A trail stop, a catastrophe stop, an E3 state exit, or the kill-switch flatten still runs. Those cuts do not wait for a review. A stale 1h bar blocks a new entry; it does not block a stop on a daily bar the store already has.
+A trail stop, a catastrophe stop, an E3 state exit, or the kill-switch flatten still runs. Those cuts do not wait for a review. A stale daily close blocks a new entry; it does not block a stop on a daily bar the store already has. A refresh that hits HTTP 418 or 429, or loses vision for a minute, logs the error and leaves the process running. It does not stand in front of that stop.
 
 Equity is the paper ledger (starting capital plus simulated P&L). This build never reads account equity from Binance. There is no key to read it with. `account.news_status` in the committed file is null, so every open is refused until you set it. Set it to `ALLOW` only when you accept that this host is not connected to News Watcher. That is an assumption you are making, not a feed.
 

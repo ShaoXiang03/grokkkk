@@ -12,6 +12,7 @@ import zipfile
 from datetime import datetime, timezone
 
 VISION = "https://data.binance.vision/data/futures/um/monthly"
+VISION_DAILY = "https://data.binance.vision/data/futures/um/daily"
 
 
 def iter_months(start_ms: int, end_ms: int) -> list[str]:
@@ -42,7 +43,12 @@ def premium_url(symbol: str, interval: str, month: str) -> str:
 
 def metrics_url(symbol: str, day: str) -> str:
     """Daily 5-minute metrics file. `day` is YYYY-MM-DD."""
-    return f"https://data.binance.vision/data/futures/um/daily/metrics/{symbol}/{symbol}-metrics-{day}.zip"
+    return f"{VISION_DAILY}/metrics/{symbol}/{symbol}-metrics-{day}.zip"
+
+
+def kline_daily_url(symbol: str, interval: str, day: str) -> str:
+    """One UTC day of klines. `day` is YYYY-MM-DD. Not an IP-weight route."""
+    return f"{VISION_DAILY}/klines/{symbol}/{interval}/{symbol}-{interval}-{day}.zip"
 
 
 def parse_kline_csv(text: str) -> list[dict]:
@@ -113,6 +119,14 @@ def fetch_bytes(url: str, session, timeout: float) -> bytes | None:
 
 def load_klines_month(session, symbol: str, interval: str, month: str, timeout: float) -> list[dict] | None:
     payload = fetch_bytes(kline_url(symbol, interval, month), session, timeout)
+    if payload is None:
+        return None
+    return parse_kline_csv(_zip_text(payload))
+
+
+def load_klines_day(session, symbol: str, interval: str, day: str, timeout: float) -> list[dict] | None:
+    """Daily archive file. None is HTTP 404. Other statuses raise. No retry."""
+    payload = fetch_bytes(kline_daily_url(symbol, interval, day), session, timeout)
     if payload is None:
         return None
     return parse_kline_csv(_zip_text(payload))

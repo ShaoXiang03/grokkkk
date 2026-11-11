@@ -174,6 +174,9 @@ def default_settings() -> dict[str, Any]:
         "paper": {
             "initial_equity": 800,
             "clock_days": 14,
+            # Slack on the close timestamp. For a 1h setup this is the whole
+            # horizon (90 minutes). For a daily book it is added on top of the
+            # requirement that the last 00:00 UTC close is in the store.
             "max_data_age_seconds": 5400,
             "kill_switch_path": "data/KILL",
             "loop_seconds": 60,
@@ -193,6 +196,13 @@ def default_settings() -> dict[str, Any]:
             "request_timeout_seconds": 20,
             "request_pause_seconds": 0.25,
             "kline_limit": 1500,
+            # Hard cap on fapi request weight this process will spend per
+            # rolling minute. The exchange IP limit is 2400. This host is
+            # shared with live trading, so the default stays at 300. Values
+            # above 600 are clamped.
+            "request_weight_per_minute": 300,
+            # Stop calling fapi when X-MBX-USED-WEIGHT-1M is above this.
+            "used_weight_pause": 1200,
             "symbols": [],
         },
         "backtest": {

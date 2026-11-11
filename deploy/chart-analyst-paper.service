@@ -11,6 +11,9 @@ Group=chartanalyst
 WorkingDirectory=/opt/chart-analyst
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/chart-analyst/secrets.env
+# --refresh gap-fills daily bars from data.binance.vision, then calls fapi
+# only for the last day or two. Weight is capped at data.request_weight_per_minute
+# (300). A 418 or 429 pauses that refresh; it does not restart the unit.
 ExecStart=/opt/chart-analyst/.venv/bin/python scripts/run_paper.py --loop --refresh --serve
 Restart=on-failure
 RestartSec=5

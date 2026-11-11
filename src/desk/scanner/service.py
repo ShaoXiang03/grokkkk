@@ -119,6 +119,11 @@ def scan_once(
 
 
 def refresh_symbols(settings: dict, store: Store, symbols: list[str], *, days: int, daily_days: int) -> None:
+    """Manual scanner backfill for a short symbol list.
+
+    Not weight-capped. The paper loop does not call this. A universe-sized
+    refresh belongs on `PaperRefresh`, which stays inside the fapi budget.
+    """
     client = BinancePublicClient(
         settings["data"]["rest_base"],
         timeout=float(settings["data"]["request_timeout_seconds"]),
