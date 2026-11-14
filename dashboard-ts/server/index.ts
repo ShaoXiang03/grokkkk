@@ -21,6 +21,8 @@ import {
   signSession,
   tokensEqual,
 } from "./auth.js";
+import { SnapshotHub } from "./hub.js";
+import { cachedProbe } from "./probe.js";
 import { readDesk, type ReadInput } from "./read.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -62,20 +64,6 @@ export function defaultOptions(token: string): AppOptions {
   };
 }
 
-let reviewCache: { at: number; ok: boolean; status: number | null } = { at: 0, ok: false, status: null };
-
-async function reviewHealth(url: string | undefined): Promise<{ ok: boolean; status: number | null }> {
-  if (!url) return { ok: false, status: null };
-  if (Date.now() - reviewCache.at < 5_000) return reviewCache;
-  try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(1500) });
-    reviewCache = { at: Date.now(), ok: response.ok, status: response.status };
-  } catch {
-    reviewCache = { at: Date.now(), ok: false, status: null };
-  }
-  return reviewCache;
-}
-
 function snapshotInput(opts: AppOptions, review: { ok: boolean; status: number | null }): ReadInput {
   return {
     sqlitePath: opts.sqlitePath,
@@ -89,6 +77,10 @@ function snapshotInput(opts: AppOptions, review: { ok: boolean; status: number |
 }
 
 export function createApp(opts: AppOptions) {
+  const hub = new SnapshotHub(async () => {
+    const review = await cachedProbe(opts.reviewUrl);
+    return readDesk(snapshotInput(opts, review));
+  });
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "2kb" }));
@@ -126,8 +118,7 @@ export function createApp(opts: AppOptions) {
   const guard = requireAuth(opts.token);
 
   app.get("/api/health", guard, async (_req, res) => {
-    const review = await reviewHealth(opts.reviewUrl);
-    const snap = readDesk(snapshotInput(opts, review));
+    const snap = await hub.current();
     res.setHeader("Cache-Control", "no-store");
     res.json({
       ok: snap.error == null,
@@ -135,39 +126,24 @@ export function createApp(opts: AppOptions) {
       orders: false,
       mode: snap.mode,
       cycleRecent: snap.health.cycleRecent,
-      reviewOk: review.ok,
+      reviewOk: snap.health.reviewOk,
     });
   });
 
   app.get("/api/state", guard, async (_req, res) => {
-    const review = await reviewHealth(opts.reviewUrl);
     res.setHeader("Cache-Control", "no-store");
-    res.json(readDesk(snapshotInput(opts, review)));
+    res.json(await hub.current());
   });
 
-  app.get("/api/stream", guard, async (req, res) => {
+  app.get("/api/stream", guard, (req, res) => {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-store",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
     });
-    let closed = false;
-    req.on("close", () => { closed = true; });
-    const send = async () => {
-      if (closed) return;
-      try {
-        const review = await reviewHealth(opts.reviewUrl);
-        const body = `data: ${JSON.stringify(readDesk(snapshotInput(opts, review)))}\n\n`;
-        if (res.writableLength > 4_000_000) { res.end(); closed = true; return; }
-        res.write(body);
-      } catch {
-        /* a bad read must not kill the process; the next tick tries again */
-      }
-    };
-    await send();
-    const timer = setInterval(send, 2_000);
-    req.on("close", () => clearInterval(timer));
+    hub.add(res);
+    req.on("close", () => hub.remove(res));
   });
 
   app.use((req, res, next) => {

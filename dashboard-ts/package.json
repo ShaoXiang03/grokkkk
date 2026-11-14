@@ -9,7 +9,7 @@
     "start": "tsx server/index.ts",
     "dev": "tsx watch server/index.ts",
     "build": "npm run build -w web",
-    "test": "tsx --test server/read.test.ts server/auth.test.ts",
+    "test": "tsx --test server/read.test.ts server/auth.test.ts server/hub.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json"
   },
   "dependencies": {
