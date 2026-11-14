@@ -7,7 +7,7 @@
  * Nothing here writes, and settings values that look like secrets are not copied out.
  */
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { parse as parseYaml } from "yaml";
@@ -46,10 +46,17 @@ export function readDesk(input: ReadInput): DeskSnapshot {
   }
 }
 
+const settingsCache = new Map<string, { mtimeMs: number; size: number; value: Record<string, unknown> }>();
+
 function loadSettings(file: string): Record<string, unknown> {
   if (!file || !existsSync(file)) return {};
+  const st = statSync(file);
+  const hit = settingsCache.get(file);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.value;
   const parsed = parseYaml(readFileSync(file, "utf8"));
-  return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  const value = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  settingsCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, value });
+  return value;
 }
 
 function secretValues(settings: Record<string, unknown>): string[] {
@@ -104,7 +111,8 @@ function assemble(db: Database.Database, settings: Record<string, unknown>, inpu
   const btc = btcCurve(db, started, initial, now);
   const books = bookCards(db, settings, positions, trades, initial, base, now, started);
   const signals = loadSignals(db, now, timeout);
-  const events = loadEvents(db, input.journalPath);
+  const journal = readJournalTail(input.journalPath);
+  const events = loadEvents(db, journal.recent);
   const dd = maxDrawdown(curve.map((p) => p.equity));
   const openRiskUsdt = positions.reduce((s, p) => s + p.risk, 0);
   const capPct = Number(risk.max_open_risk_pct ?? 0.06);
@@ -148,7 +156,7 @@ function assemble(db: Database.Database, settings: Record<string, unknown>, inpu
           ? "Review API on 127.0.0.1:8787 answered /health."
           : "Review API on 127.0.0.1:8787 did not answer /health. This page does not submit reviews.",
       reviewOk: Boolean(review?.ok),
-      journalLines: journalLines(input.journalPath),
+      journalLines: journal.lines,
     },
     equity,
     initialEquity: initial,
@@ -290,7 +298,7 @@ function hint(status: SignalRow["status"], kind: string | null): string {
   return "Rejected by a hard gate.";
 }
 
-function loadEvents(db: Database.Database, journalPath: string | undefined): FeedEvent[] {
+function loadEvents(db: Database.Database, recent: Row[]): FeedEvent[] {
   const rows = all(db, "SELECT id, ts_ms, signal_id, event, payload FROM decision_journal ORDER BY id DESC LIMIT 80");
   if (rows.length) {
     return rows.map((row) => {
@@ -306,7 +314,7 @@ function loadEvents(db: Database.Database, journalPath: string | undefined): Fee
       };
     });
   }
-  return tailJsonl(journalPath).map((row, i) => ({
+  return [...recent].reverse().map((row, i) => ({
     id: String(row.id ?? i),
     t: Number(row.ts_ms ?? 0),
     kind: String(row.event ?? "event"),
@@ -325,19 +333,46 @@ function summary(event: string, payload: Row, packet: Row): string {
   return event;
 }
 
-function tailJsonl(file: string | undefined): Row[] {
-  if (!file || !existsSync(file)) return [];
-  const lines = readFileSync(file, "utf8").split("\n").filter((line) => line.trim());
-  const out: Row[] = [];
-  for (const line of lines.slice(-80)) {
-    try { out.push(JSON.parse(line) as Row); } catch { /* skip a torn line */ }
-  }
-  return out.reverse();
+interface JournalTail {
+  ino: number;
+  offset: number;
+  lines: number;
+  recent: Row[];
 }
 
-function journalLines(file: string | undefined): number {
-  if (!file || !existsSync(file)) return 0;
-  return readFileSync(file, "utf8").split("\n").filter((line) => line.trim()).length;
+const journalTails = new Map<string, JournalTail>();
+
+/** Byte offset into journal.jsonl. A later call reads only the bytes appended since the last one. */
+export function readJournalTail(file: string | undefined): { lines: number; recent: Row[] } {
+  if (!file || !existsSync(file)) return { lines: 0, recent: [] };
+  const st = statSync(file);
+  let state = journalTails.get(file);
+  if (!state || state.ino !== st.ino || st.size < state.offset) {
+    state = { ino: st.ino, offset: 0, lines: 0, recent: [] };
+    journalTails.set(file, state);
+  }
+  if (st.size === state.offset) return { lines: state.lines, recent: state.recent };
+  const fd = openSync(file, "r");
+  try {
+    const buf = Buffer.alloc(st.size - state.offset);
+    const n = readSync(fd, buf, 0, buf.length, state.offset);
+    const slice = buf.subarray(0, n);
+    const last = slice.lastIndexOf(0x0a);
+    if (last < 0) return { lines: state.lines, recent: state.recent };
+    const text = slice.subarray(0, last + 1).toString("utf8");
+    state.offset += last + 1;
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      state.lines += 1;
+      try {
+        state.recent.push(JSON.parse(line) as Row);
+        if (state.recent.length > 80) state.recent.shift();
+      } catch { /* a torn line is not an event */ }
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return { lines: state.lines, recent: state.recent };
 }
 
 function bookCards(db: Database.Database, settings: Record<string, unknown>, positions: PositionRow[], trades: TradeRow[], initial: number, base: number, now: number, started: number | null): BookCard[] {
@@ -700,7 +735,7 @@ function emptySnapshot(now: number, settings: Record<string, unknown>, error: st
       archiveDays: 0,
       reviewPlain: "Not checked.",
       reviewOk: false,
-      journalLines: journalLines(input.journalPath),
+      journalLines: readJournalTail(input.journalPath).lines,
     },
     equity: null, initialEquity: null, openPnl: null, deskReturn: null, drawdown: null, grossLeverage: null,
     openRisk: { usdt: 0, cap: null, fraction: null, capPct: 0.06 },
