@@ -26,6 +26,8 @@ export interface ReadInput {
   killPath?: string;
   now?: number;
   review?: { ok: boolean; status: number | null } | null;
+  /** Test hook. Records each statement the snapshot actually runs. */
+  trace?: (sql: string, params: unknown[]) => void;
 }
 
 type Row = Record<string, unknown>;
@@ -37,12 +39,15 @@ export function readDesk(input: ReadInput): DeskSnapshot {
   if (!existsSync(input.sqlitePath)) {
     return scrub(emptySnapshot(now, settings, "The sqlite database is not there. This process does not create it.", input), denylist);
   }
+  const previous = traceQuery;
+  traceQuery = input.trace ?? null;
   const db = new Database(input.sqlitePath, { readonly: true, fileMustExist: true, timeout: 2000 });
   try {
     try { db.pragma("query_only = ON"); } catch { /* readonly already refuses writes */ }
     return scrub(assemble(db, settings, input, now), denylist);
   } finally {
     db.close();
+    traceQuery = previous;
   }
 }
 
@@ -100,7 +105,7 @@ function assemble(db: Database.Database, settings: Record<string, unknown>, inpu
   const news = newsView(dict(settings.account).news_status);
   const killPath = input.killPath ?? resolveKill(settings, input.settingsPath);
   const kill = killView(killPath);
-  const stale = staleView(db, settings, now);
+  const market = loadMarket(db, settings, now);
   const updated = account?.updated_ms == null ? null : Number(account.updated_ms);
   const loopS = Number(paper.loop_seconds ?? 60);
   const recent = updated !== null && Math.abs(now - updated) <= Math.max(loopS * 3, 180) * 1000;
@@ -137,14 +142,14 @@ function assemble(db: Database.Database, settings: Record<string, unknown>, inpu
       newsBlocking: news.blocking,
       killPlain: kill.plain,
       killOn: kill.on,
-      stalePlain: stale.plain,
-      staleBlocking: stale.blocking,
+      stalePlain: market.stale.plain,
+      staleBlocking: market.stale.blocking,
       ordersPlain: "Orders are off. There is no order client. This page cannot place, cancel, or approve anything.",
       equityPlain: equity ? `Paper equity ${equity.toFixed(2)} USDT from the local ledger. Binance equity is not read.` : "Paper equity could not be marked.",
       cyclePlain: cyclePlain(lastBlock, news.blocking, recent),
       cycleRecent: recent,
       roster: roster(settings),
-      freshness: freshness(db, settings, now),
+      freshness: market.freshness,
       refreshPlain: refreshPlain(refresh, weight, pauseAbove),
       weightPerMinute: weight,
       pauseAbove,
@@ -216,7 +221,13 @@ function loadPositions(db: Database.Database, now: number): PositionRow[] {
 }
 
 function latestClose(db: Database.Database, symbol: string, interval: string, now: number): number | null {
-  const row = one(db, "SELECT close FROM klines WHERE symbol = ? AND interval = ? AND close_time <= ? ORDER BY open_time DESC LIMIT 1", symbol, interval, now);
+  const row = one(
+    db,
+    `SELECT close FROM klines
+     WHERE symbol = ? AND interval = ? AND open_time <= ? AND close_time <= ?
+     ORDER BY open_time DESC LIMIT 1`,
+    symbol, interval, now, now,
+  );
   const close = num(row?.close);
   return close && close > 0 ? close : null;
 }
@@ -411,8 +422,8 @@ function bookCards(db: Database.Database, settings: Record<string, unknown>, pos
 
 function btcCurve(db: Database.Database, started: number | null, initial: number, now: number): { curve: CurvePoint[]; ret: number | null } {
   if (started == null || !(initial > 0)) return { curve: [], ret: null };
-  let series = closes(db, "BTCUSDT", "1h", now);
-  if (!series.length) series = closes(db, "BTCUSDT", "1d", now);
+  let series = closes(db, "BTCUSDT", "1h", now, started);
+  if (!series.length) series = closes(db, "BTCUSDT", "1d", now, started);
   if (!series.length) return { curve: [], ret: null };
   let startPx: number | null = null;
   for (const bar of series) if (bar.t <= started) startPx = bar.px;
@@ -422,59 +433,128 @@ function btcCurve(db: Database.Database, started: number | null, initial: number
   return { curve: downsample(curve), ret: curve[curve.length - 1].equity / initial - 1 };
 }
 
-function closes(db: Database.Database, symbol: string, interval: string, now: number): { t: number; px: number }[] {
-  return all(db, "SELECT close_time AS t, close AS px FROM klines WHERE symbol = ? AND interval = ? AND close_time <= ? AND close > 0 ORDER BY open_time", symbol, interval, now)
-    .map((r) => ({ t: Number(r.t), px: Number(r.px) }));
-}
-
-function staleView(db: Database.Database, settings: Record<string, unknown>, now: number): { blocking: boolean; plain: string } {
-  const setups = Object.values(dict(settings.setups)).some((cfg) => dict(cfg).enabled === true);
-  const names = dueDaily(db);
-  if (setups) {
-    const maxAge = Number(dict(settings.paper).max_data_age_seconds ?? 5400) * 1000;
-    const stale = names.filter((symbol) => {
-      const close = latestCloseTime(db, symbol, "1h", now);
-      return close == null || now - close > maxAge;
-    });
-    if (stale.length) return { blocking: true, plain: `New entries are refused. Stale 1h bars: ${stale.slice(0, 8).join(",")}.` };
+function closes(db: Database.Database, symbol: string, interval: string, now: number, started: number): { t: number; px: number }[] {
+  const width = interval === "1d" ? DAY : interval === "4h" ? 4 * HOUR : HOUR;
+  const seed = one(
+    db,
+    `SELECT close_time AS t, close AS px FROM klines
+     WHERE symbol = ? AND interval = ? AND open_time <= ? AND close_time <= ? AND close > 0
+     ORDER BY open_time DESC LIMIT 1`,
+    symbol, interval, started, started,
+  );
+  const rows = all(
+    db,
+    `SELECT close_time AS t, close AS px FROM klines
+     WHERE symbol = ? AND interval = ? AND open_time > ? AND close_time <= ? AND close > 0
+     ORDER BY open_time`,
+    symbol, interval, started - width, now,
+  );
+  const out: { t: number; px: number }[] = [];
+  if (seed?.t != null) out.push({ t: Number(seed.t), px: Number(seed.px) });
+  for (const row of rows) {
+    const point = { t: Number(row.t), px: Number(row.px) };
+    if (point.t > started) out.push(point);
   }
-  if (!names.length) return { blocking: true, plain: "New entries are refused. No daily names are stored to check." };
-  const expected = Math.floor(now / DAY) * DAY;
-  const grace = Number(dict(settings.paper).max_data_age_seconds ?? 5400) * 1000;
-  const stale = names.filter((symbol) => {
-    const close = latestCloseTime(db, symbol, "1d", now);
-    return close == null || close + grace < expected;
-  });
-  if (stale.length) return { blocking: true, plain: `New entries are refused because stored daily bars are stale (${stale.slice(0, 8).join(",")}). Stops still run.` };
-  return { blocking: false, plain: "New entries are not blocked by stale data. Closed 1d bars are fresh." };
+  return out;
 }
 
-function dueDaily(db: Database.Database): string[] {
-  const names = all(db, "SELECT DISTINCT symbol FROM klines WHERE interval = '1d' ORDER BY symbol").map((r) => String(r.symbol));
+/** Names we can price from the (symbol, interval, open_time) primary key. */
+const REFERENCE_SYMBOLS = ["BTCUSDT", "ETHUSDT"];
+const FRESHNESS_MS = 60_000;
+const INTERVALS = ["1h", "4h", "1d"] as const;
+
+interface FreshnessRow {
+  interval: string;
+  fresh: boolean;
+  plain: string;
+  symbols: number;
+}
+
+interface MarketView {
+  freshness: FreshnessRow[];
+  stale: { blocking: boolean; plain: string };
+}
+
+const marketCache = new Map<string, MarketView>();
+
+function loadMarket(db: Database.Database, settings: Record<string, unknown>, now: number): MarketView {
+  const maxAge = Number(dict(settings.paper).max_data_age_seconds ?? 5400) * 1000;
+  const setups = Object.values(dict(settings.setups)).some((cfg) => dict(cfg).enabled === true);
+  const key = `${db.name}|${Math.floor(now / FRESHNESS_MS)}|${maxAge}|${setups ? 1 : 0}`;
+  const hit = marketCache.get(key);
+  if (hit) return hit;
+  const symbols = watchSymbols(db);
+  const closeAt = new Map<string, number | null>();
+  for (const interval of INTERVALS) {
+    for (const symbol of symbols) closeAt.set(`${symbol}|${interval}`, latestCloseTime(db, symbol, interval, now));
+  }
+  const view = { freshness: freshnessRows(closeAt, symbols, maxAge, now), stale: staleFrom(closeAt, symbols, setups, maxAge, now) };
+  marketCache.set(key, view);
+  if (marketCache.size > 8) marketCache.delete(marketCache.keys().next().value ?? "");
+  return view;
+}
+
+function watchSymbols(db: Database.Database): string[] {
+  const held = all(db, "SELECT symbol FROM paper_book_positions").map((row) => String(row.symbol));
+  const names = [...new Set([...REFERENCE_SYMBOLS, ...held])].sort();
   const listed = all(db, "SELECT symbol, status FROM symbols");
   if (!listed.length) return names;
-  const status = new Map(listed.map((r) => [String(r.symbol), String(r.status ?? "")]));
+  const status = new Map(listed.map((row) => [String(row.symbol), String(row.status ?? "")]));
   return names.filter((name) => status.get(name) !== "DELISTED");
 }
 
 function latestCloseTime(db: Database.Database, symbol: string, interval: string, now: number): number | null {
-  const row = one(db, "SELECT MAX(close_time) AS t FROM klines WHERE symbol = ? AND interval = ? AND close_time <= ?", symbol, interval, now);
+  const row = one(
+    db,
+    `SELECT close_time AS t FROM klines
+     WHERE symbol = ? AND interval = ? AND open_time <= ? AND close_time <= ?
+     ORDER BY open_time DESC LIMIT 1`,
+    symbol, interval, now, now,
+  );
   return row?.t == null ? null : Number(row.t);
 }
 
-function freshness(db: Database.Database, settings: Record<string, unknown>, now: number) {
-  const maxAge = Number(dict(settings.paper).max_data_age_seconds ?? 5400) * 1000;
+function freshnessRows(closeAt: Map<string, number | null>, symbols: string[], maxAge: number, now: number): FreshnessRow[] {
   const expected = Math.floor(now / DAY) * DAY;
-  return ["1h", "4h", "1d"].map((interval) => {
-    const row = one(db, "SELECT MAX(close_time) AS t, COUNT(DISTINCT symbol) AS n FROM klines WHERE interval = ?", interval);
-    const latest = row?.t == null ? null : Number(row.t);
-    const symbols = Number(row?.n ?? 0);
+  return INTERVALS.map((interval) => {
+    let latest: number | null = null;
+    let count = 0;
+    for (const symbol of symbols) {
+      const close = closeAt.get(`${symbol}|${interval}`) ?? null;
+      if (close == null) continue;
+      count += 1;
+      if (latest == null || close > latest) latest = close;
+    }
     const fresh = latest == null ? false : interval === "1d" ? latest + maxAge >= expected : now - latest <= maxAge;
     const plain = latest == null
-      ? `No ${interval} bars are stored.`
+      ? `No ${interval} bars are stored for ${symbols.join(", ") || "BTCUSDT, ETHUSDT"}.`
       : `Latest ${interval} close ${formatMyt(latest)}.`;
-    return { interval, fresh, plain, symbols };
+    return { interval, fresh, plain, symbols: count };
   });
+}
+
+function staleFrom(
+  closeAt: Map<string, number | null>,
+  symbols: string[],
+  setups: boolean,
+  maxAge: number,
+  now: number,
+): { blocking: boolean; plain: string } {
+  if (setups) {
+    const stale = symbols.filter((symbol) => {
+      const close = closeAt.get(`${symbol}|1h`) ?? null;
+      return close == null || now - close > maxAge;
+    });
+    if (stale.length) return { blocking: true, plain: `New entries are refused. Stale 1h bars: ${stale.slice(0, 8).join(",")}.` };
+  }
+  if (!symbols.length) return { blocking: true, plain: "New entries are refused. No daily names are stored to check." };
+  const expected = Math.floor(now / DAY) * DAY;
+  const stale = symbols.filter((symbol) => {
+    const close = closeAt.get(`${symbol}|1d`) ?? null;
+    return close == null || close + maxAge < expected;
+  });
+  if (stale.length) return { blocking: true, plain: `New entries are refused because stored daily bars are stale (${stale.slice(0, 8).join(",")}). Stops still run.` };
+  return { blocking: false, plain: "New entries are not blocked by stale data. Closed 1d bars are fresh." };
 }
 
 function clockView(started: number | null, now: number, days: number) {
@@ -782,10 +862,14 @@ function formatSpan(open: number, timeout: number): string {
 
 function pad(n: number): string { return String(n).padStart(2, "0"); }
 
+let traceQuery: ((sql: string, params: unknown[]) => void) | null = null;
+
 function all(db: Database.Database, sql: string, ...params: unknown[]): Row[] {
+  traceQuery?.(sql, params);
   try { return db.prepare(sql).all(...params) as Row[]; } catch { return []; }
 }
 function one(db: Database.Database, sql: string, ...params: unknown[]): Row | undefined {
+  traceQuery?.(sql, params);
   try { return db.prepare(sql).get(...params) as Row | undefined; } catch { return undefined; }
 }
 function json(value: unknown): Row {

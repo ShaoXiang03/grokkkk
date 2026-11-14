@@ -140,3 +140,55 @@ setups:
   assert.throws(() => ro.prepare("INSERT INTO paper_equity (ts_ms, equity) VALUES (1, 1)").run());
   ro.close();
 });
+
+test("snapshot klines queries use the primary key and freshness is cached", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "desk-ts-plan-"));
+  const sqlitePath = seed(dir);
+  const settingsPath = path.join(dir, "settings.yaml");
+  writeFileSync(settingsPath, `
+mode: paper
+paper: { initial_equity: 800, clock_days: 14, max_data_age_seconds: 5400, loop_seconds: 60, kill_switch_path: ${JSON.stringify(path.join(dir, "NO-KILL"))} }
+strategies:
+  e2_residual_momentum: { enabled: true }
+  e3_slow_trend: { enabled: true }
+setups:
+  squeeze_breakout: { enabled: false }
+`);
+  const dailyOpen = Math.floor(NOW / 86_400_000) * 86_400_000 - 86_400_000;
+  const dailyClose = dailyOpen + 86_400_000 - 1;
+  const db = new Database(sqlitePath);
+  db.prepare("UPDATE klines SET close_time = close_time - ? WHERE interval = '1d'").run(3 * 86_400_000);
+  db.prepare("INSERT INTO klines VALUES (?,?,?,?,?,?,?,?,?,?)").run("ZZZUSDT", "1d", dailyOpen, dailyClose, 1, 1, 1, 1, 1, 1);
+  db.prepare("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?)").run("ZZZUSDT", "TRADING", "PERPETUAL", "ZZZ", "USDT", "USDT", START, NOW);
+  db.close();
+  const input = {
+    sqlitePath,
+    settingsPath,
+    refreshPath: path.join(dir, "missing-refresh.json"),
+    killPath: path.join(dir, "NO-KILL"),
+    now: NOW,
+    review: { ok: true, status: 200 },
+  };
+  const first: { sql: string; params: unknown[] }[] = [];
+  const snap = readDesk({ ...input, trace: (sql, params) => first.push({ sql, params }) });
+  assert.equal(snap.health.freshness.find((row) => row.interval === "1d")?.fresh, false);
+  assert.equal(snap.health.freshness.find((row) => row.interval === "4h")?.fresh, false);
+  assert.equal(snap.health.staleBlocking, true);
+  assert.match(snap.health.stalePlain, /BTCUSDT/);
+  const explain = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  const klines = first.filter((query) => query.sql.includes("klines"));
+  assert.ok(klines.length > 0);
+  for (const query of klines) {
+    assert.equal(/COUNT\s*\(\s*DISTINCT/i.test(query.sql), false, query.sql);
+    assert.match(query.sql, /symbol = \?/);
+    const plan = explain.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.params) as { detail: string }[];
+    for (const row of plan) {
+      assert.equal(/SCAN\s+klines/i.test(row.detail), false, `${query.sql} -> ${row.detail}`);
+      assert.match(row.detail, /sqlite_autoindex_klines_1/);
+    }
+  }
+  explain.close();
+  const second: unknown[][] = [];
+  readDesk({ ...input, trace: (sql, params) => { if (sql.includes("klines")) second.push(params); } });
+  assert.equal(second.some((params) => params.includes("4h")), false);
+});
