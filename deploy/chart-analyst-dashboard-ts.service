@@ -1,0 +1,32 @@
+[Unit]
+Description=Chart Analyst TypeScript dashboard (read-only, public port 8099)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chartanalyst
+Group=chartanalyst
+WorkingDirectory=/opt/chart-analyst/dashboard-ts
+Environment=HOST=0.0.0.0
+Environment=PORT=8099
+Environment=DASHBOARD_ENV=/etc/chart-analyst/dashboard-ts.env
+Environment=DESK_SQLITE=/var/lib/chart-analyst/desk.sqlite
+Environment=DESK_JOURNAL=/var/lib/chart-analyst/journal.jsonl
+Environment=DESK_REFRESH=/var/lib/chart-analyst/refresh_status.json
+Environment=DESK_SETTINGS=/opt/chart-analyst/config/settings.yaml
+Environment=REVIEW_HEALTH=http://127.0.0.1:8787/health
+ExecStart=/opt/chart-analyst/dashboard-ts/node_modules/.bin/tsx server/index.ts
+Nice=10
+MemoryMax=512M
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/chart-analyst /opt/chart-analyst
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,8 @@ The working partial is **50% at 2R**. `exits.partial_at_r` can be set to `1.0` t
 | `src/desk/paper/` | Simulated fills, kill switch, 14-day clock, scorecard. No order client. |
 | `src/desk/backtest/` | Same evaluation path, costs, metrics, walk-forward split. |
 | `docs/deploy.md` | systemd, env file, log rotation. |
-| `docs/dashboard.md` | Read-only monitoring dashboard on `127.0.0.1:8788`. |
+| `docs/dashboard.md` | Read-only Python dashboard on `127.0.0.1:8788`. |
+| `docs/dashboard-ts.md` | TypeScript dashboard on `:8099`, with a login. |
 | `scripts/` | Backfill, scanner, backtest, paper, review, export, outbox drain. |
 
 `src/desk/execution/` is absent on purpose. There is no order placement. A new setup becomes eligible by emitting a packet whose hard gates pass; the webhook, journal, and paper loop do not need a code change for that.
