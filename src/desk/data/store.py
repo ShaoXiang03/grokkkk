@@ -330,6 +330,20 @@ class Store:
             return None
         return int(row["t"])
 
+    def latest_daily_quote_volume(self, symbol: str) -> float | None:
+        """Last stored daily quote volume. Uses the (symbol, interval, open_time) key."""
+        row = self.conn.execute(
+            """
+            SELECT quote_volume FROM klines
+            WHERE symbol = ? AND interval = '1d'
+            ORDER BY open_time DESC LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+        if row is None or row["quote_volume"] is None:
+            return None
+        return float(row["quote_volume"])
+
     def latest_open_time(self, symbol: str, interval: str) -> int | None:
         row = self.conn.execute(
             "SELECT MAX(open_time) AS t FROM klines WHERE symbol = ? AND interval = ?",

@@ -376,6 +376,30 @@ def _daily_settings(tmp_path):
     return settings
 
 
+def test_held_and_liquid_names_refresh_before_the_tail(tmp_path):
+    store = Store(tmp_path / "desk.sqlite")
+    seen: list[str] = []
+
+    def fetch(symbol, day):
+        seen.append(symbol)
+        return [_bar(_ms(day), price=101.0)]
+
+    # One stored day, so each name needs the next vision file. Volume order is
+    # the reverse of the walk order the cursor would have used.
+    names = [f"N{i:02d}USDT" for i in range(6)]
+    stored = NOV10 - DAY_MS
+    for index, symbol in enumerate(names):
+        bar = _bar(stored, price=100.0)
+        bar["quote_volume"] = float(index + 1)
+        store.upsert_klines(symbol, "1d", [bar])
+    store.save_book_position("e3", "N00USDT", "{}", NOW)
+    client = _Client()
+    _settings, refresher = _refresh(tmp_path, client, fetch)
+    refresher.run_slice(store, list(reversed(names)), NOW, max_wall_ms=10**9, max_vision_files=3)
+    assert seen[:3] == ["N00USDT", "N05USDT", "N04USDT"]
+    store.close()
+
+
 def test_daily_close_is_fresh_for_hours_and_stale_when_the_close_is_missing(tmp_path):
     settings = _daily_settings(tmp_path)
     store = Store(tmp_path / "desk.sqlite")
