@@ -136,6 +136,8 @@ account:
   daily_pnl_pct: 0.0
   weekly_pnl_pct: 0.0
   news_status: null
+  # News Watcher feed. Stays off until reviewed. See docs/news-feed.md.
+  news_feed_enabled: false
 
 blocklist:
   # Local list is readable. Set available: false to simulate News Watcher down.

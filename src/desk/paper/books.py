@@ -31,6 +31,7 @@ import numpy as np
 from desk.config import assert_no_live_orders
 from desk.delivery.outbox import enqueue_packet
 from desk.journal.decision import DecisionJournal
+from desk.rules.news_feed import news_feed_enabled, news_verdict, packet_symbols
 from desk.rules.risk_gates import gate
 from desk.scanner.signals import empty_market_context, empty_master_decision, validate_packet
 from desk.strategies.catalog import primary_variant, variant_by_id
@@ -368,7 +369,7 @@ def fill_books(settings: dict, store, now_ms: int, journal: DecisionJournal, sna
             continue
         from desk.delivery.eligibility import entry_blocks
 
-        blocks = entry_blocks(packet, _account(snapshot), views, settings, now_ms)
+        blocks = entry_blocks(packet, _account(snapshot), views, settings, now_ms, store=store)
         if blocks:
             detail = "fill refused by " + ", ".join(blocks)
             store.append_paper_event(now_ms, "violation", "live_gate_block", signal_id, detail)
@@ -405,11 +406,19 @@ def fill_books(settings: dict, store, now_ms: int, journal: DecisionJournal, sna
     return filled
 
 
-def book_fresh_blocks(packet: dict, account: dict | None, open_positions: list[dict], settings: dict, now_ms: int) -> list[str]:
+def book_fresh_blocks(
+    packet: dict,
+    account: dict | None,
+    open_positions: list[dict],
+    settings: dict,
+    now_ms: int,
+    store=None,
+) -> list[str]:
     """Recheck news, loss pauses, and the shared caps for a book packet."""
     blocks = []
-    news = None if account is None else account.get("news_status")
-    if news is None or str(news).upper() != "ALLOW":
+    fallback = None if account is None else account.get("news_status")
+    allowed, _reason = news_verdict(settings, store, now_ms, packet_symbols(packet), fallback)
+    if not allowed:
         blocks.append("news")
     equity = _as_float(None if account is None else account.get("equity_usdt"))
     if equity is None or equity <= 0:
@@ -954,14 +963,18 @@ def _build_packet(settings, spec, *, kind, symbol, direction, day, ts, now_ms, s
     packet_stub = {"packet_kind": kind, "book": spec["book"]}
     existing = _existing_for_packet(snapshot.get("open_positions") or [], packet_stub, targets)
     breaches = set(cap_breach_names(existing, targets, equity, settings))
-    news = snapshot.get("news_status")
-    news_ok = news is not None and str(news).upper() == "ALLOW"
+    if news_feed_enabled(settings):
+        news_ok, news_reason = news_verdict(settings, store, now_ms, [symbol, *[row.symbol for row in targets]], None)
+    else:
+        news = snapshot.get("news_status")
+        news_ok = news is not None and str(news).upper() == "ALLOW"
+        news_reason = "News Watcher ALLOW" if news_ok else "News Watcher status is missing"
     daily = snapshot.get("daily_pnl_pct")
     weekly = snapshot.get("weekly_pnl_pct")
     daily_ok = daily is not None and float(daily) > float(settings["risk"]["daily_loss_pause_pct"])
     weekly_ok = weekly is not None and float(weekly) > float(settings["risk"]["weekly_loss_pause_pct"])
     checks = {
-        "news": (news_ok, "News Watcher ALLOW" if news_ok else "News Watcher status is missing"),
+        "news": (news_ok, news_reason),
         "equity": (equity > 0, "paper equity"),
         "open_risk": ("open_risk" not in breaches, "open risk inside 6%" if "open_risk" not in breaches else "open risk cap"),
         "cluster": ("cluster" not in breaches, "cluster risk inside 3%" if "cluster" not in breaches else "cluster cap"),

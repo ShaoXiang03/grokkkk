@@ -338,7 +338,7 @@ def fill_pending(store, settings: dict, now_ms: int, snapshot: dict, journal: De
         if int(now_ms) - int(packet.get("ts_ms") or 0) > timeout_ms:
             _refuse(store, journal, now_ms, signal_id, "stale_signal", "signal is outside the decision window")
             continue
-        blocks = entry_blocks(packet, account, positions, settings, now_ms)
+        blocks = entry_blocks(packet, account, positions, settings, now_ms, store=store)
         if blocks:
             kind = "live_gate_block"
             detail = "fill refused by " + ", ".join(blocks)

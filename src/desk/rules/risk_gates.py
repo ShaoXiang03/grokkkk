@@ -258,6 +258,7 @@ def fresh_account_blocks(
     open_positions: list[dict],
     settings: dict,
     now_ms: int,
+    store=None,
 ) -> list[str]:
     """Re-check vetoes and caps that can change after the packet was built.
 
@@ -268,13 +269,20 @@ def fresh_account_blocks(
     if packet.get("packet_kind") in ("rebalance", "book_entry"):
         from desk.paper.books import book_fresh_blocks
 
-        return book_fresh_blocks(packet, account, open_positions, settings, now_ms)
+        return book_fresh_blocks(packet, account, open_positions, settings, now_ms, store=store)
     blocks: list[str] = []
     equity = _as_float(None if account is None else account.get("equity_usdt"))
     risk = _as_float(packet.get("risk_usdt"))
-    news = None if account is None else account.get("news_status")
-    if news is None or str(news).upper() != "ALLOW":
-        blocks.append("news")
+    from desk.rules.news_feed import news_feed_enabled, news_verdict
+
+    if news_feed_enabled(settings):
+        allowed, _reason = news_verdict(settings, store, now_ms, [str(packet.get("symbol") or "")], None)
+        if not allowed:
+            blocks.append("news")
+    else:
+        news = None if account is None else account.get("news_status")
+        if news is None or str(news).upper() != "ALLOW":
+            blocks.append("news")
     if equity is None or equity <= 0 or risk is None:
         blocks.extend(["open_risk", "cluster"])
     else:

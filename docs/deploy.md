@@ -188,6 +188,8 @@ sudo -u chartanalyst .venv/bin/python scripts/attach_decision.py \
 
 The remote endpoint is `POST /signals/<signal_id>/review` with `Content-Type: application/json`, `X-Desk-Timestamp` (unix milliseconds), and `X-Desk-Signature` (hex HMAC-SHA256 of `{timestamp}.{raw_body}` using `REVIEW_SECRET`). A bad signature is rejected and not written.
 
+`POST /news` on the same loopback port accepts News Watcher statuses. The gate ignores them until `account.news_feed_enabled` is true. The token and the payload are in `docs/news-feed.md`.
+
 Outbound posts use the same signature scheme. The `Idempotency-Key` header is the signal id and does not change across retries. Failed posts stay in the SQLite outbox (`webhook_outbox`) until they are delivered or dead-lettered. A missing URL or secret leaves the row pending and does not drop the body.
 
 ```bash
