@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from desk.delivery.eligibility import ReviewError, public_review, submit_review
 from desk.delivery.signing import SIGNATURE_HEADER, TIMESTAMP_HEADER, review_secret, verify_signature
 from desk.journal.decision import DecisionJournal
+from desk.rules.news_feed import apply_news_post
 
 
 def signature_max_age_ms(settings: dict) -> int:
@@ -94,6 +95,26 @@ def serve_review(store, settings: dict, *, account_provider=None) -> ThreadingHT
 
         def do_POST(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if path == "/news":
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > 64_000:
+                    self._send(400, {"ok": False, "error": "invalid_length"})
+                    return
+                body = self.rfile.read(length) if length else b""
+                status, payload = apply_news_post(
+                    store,
+                    settings,
+                    body,
+                    dict(self.headers.items()),
+                    now_ms=_now_ms(),
+                    client_host=self.client_address[0],
+                    bind_host=host,
+                )
+                self._send(status, payload)
+                return
             prefix = "/signals/"
             suffix = "/review"
             if not (path.startswith(prefix) and path.endswith(suffix)):

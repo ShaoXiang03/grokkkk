@@ -46,13 +46,14 @@ def entry_blocks(
     open_positions: list[dict],
     settings: dict,
     now_ms: int,
+    store=None,
 ) -> list[str]:
     names = blocking_gates(packet)
     if account is None:
         if "equity" not in names:
             names.append("equity")
         return names
-    for name in fresh_account_blocks(packet, account, open_positions, settings, now_ms):
+    for name in fresh_account_blocks(packet, account, open_positions, settings, now_ms, store=store):
         if name not in names:
             names.append(name)
     return names
@@ -118,7 +119,7 @@ def submit_review(
             blocks.append("not_eligible")
         blocks.extend(
             name
-            for name in entry_blocks(packet, account, positions, settings, now_ms)
+            for name in entry_blocks(packet, account, positions, settings, now_ms, store=store)
             if name not in blocks
         )
         if not reasoning:

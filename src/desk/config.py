@@ -148,6 +148,8 @@ def default_settings() -> dict[str, Any]:
             "daily_pnl_pct": 0.0,
             "weekly_pnl_pct": 0.0,
             "news_status": None,
+            # News Watcher posts are stored but ignored until this is true.
+            "news_feed_enabled": False,
         },
         "blocklist": {"available": True, "symbols": []},
         "webhook": {

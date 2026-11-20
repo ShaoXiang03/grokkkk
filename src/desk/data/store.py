@@ -198,6 +198,14 @@ CREATE TABLE IF NOT EXISTS paper_book_meta (
     payload TEXT NOT NULL,
     updated_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS news_feed (
+    scope TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    ttl_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL
+);
 """
 
 
@@ -974,6 +982,26 @@ class Store:
         if row is None:
             return None
         return json.loads(row["payload"])
+
+    def save_news_feed(self, scope: str, status: str, reason: str, ts_ms: int, ttl_ms: int, updated_ms: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO news_feed (scope, status, reason, ts_ms, ttl_ms, updated_ms)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope) DO UPDATE SET
+                status=excluded.status,
+                reason=excluded.reason,
+                ts_ms=excluded.ts_ms,
+                ttl_ms=excluded.ttl_ms,
+                updated_ms=excluded.updated_ms
+            """,
+            (scope, status, reason, int(ts_ms), int(ttl_ms), int(updated_ms)),
+        )
+        self.conn.commit()
+
+    def get_news_feed(self, scope: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM news_feed WHERE scope = ?", (scope,)).fetchone()
+        return dict(row) if row else None
 
     def save_book_meta(self, book: str, payload: dict, updated_ms: int) -> None:
         self.conn.execute(
