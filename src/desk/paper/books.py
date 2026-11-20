@@ -39,7 +39,7 @@ from desk.strategies.engine import _size
 from desk.strategies.panel import Features, panel_from_frames
 from desk.strategies.signals import DECISIONS
 from desk.strategies.sizing import PORTFOLIO_MIN_RISK
-from desk.timeutils import DAY_MS, ms_to_myt_iso, ms_to_utc_iso
+from desk.timeutils import DAY_MS, floor_day_ms, last_closed_daily_open, ms_to_myt_iso, ms_to_utc_iso
 
 # Sunday's daily bar. weekday() of the bar's UTC open, matching the research panel.
 E2_WEEKDAY = 6
@@ -122,6 +122,126 @@ def enabled_specs(settings: dict) -> list[dict]:
             continue
         found.append({**spec, "book": book, "variant": variant, "decide": row["decide"], "params": dict(row["params"]), "expected": cfg.get("expected") or {}})
     return found
+
+
+def book_window_open(now_ms: int, timeout_ms: int) -> bool:
+    """True from the daily close (00:00 UTC, 08:00 MYT) until the deadline.
+
+    The deadline itself is closed. A cycle at that instant does not open a
+    new book decision.
+    """
+    opened = floor_day_ms(int(now_ms))
+    return opened <= int(now_ms) < opened + int(timeout_ms)
+
+
+def decision_bar_open(now_ms: int) -> int:
+    """Open time of the daily bar that closed at the start of this UTC day."""
+    return last_closed_daily_open(int(now_ms))
+
+
+def _bar_weekday(day_open_ms: int) -> int:
+    # 1970-01-01 was a Thursday. Same numbering as the research panel.
+    return (int(day_open_ms) // DAY_MS + 3) % 7
+
+
+def _decision_due(spec: dict, day_open_ms: int) -> bool:
+    if spec["cadence"] == "weekly":
+        return _bar_weekday(day_open_ms) == E2_WEEKDAY
+    return True
+
+
+def book_priority_symbols(store, settings: dict, universe: list[str] | None = None) -> list[str]:
+    """Held coins, then the liquid names the enabled books can actually pick.
+
+    The rank uses the last stored daily quote volume, which is known before
+    today's bar arrives. Callers pass the names they already intend to walk
+    so this does not scan the klines table by interval.
+    """
+    specs = enabled_specs(settings)
+    if not specs:
+        return []
+    top_n = max(int(spec["params"].get("top_n") or 40) for spec in specs)
+    held: list[str] = []
+    for row in store.book_position_rows():
+        held.append(str(row["symbol"]))
+    for row in store.paper_position_rows():
+        held.append(str(row["symbol"]))
+    pool = list(universe) if universe is not None else store.symbols_with_interval("1d")
+    pool_set = set(pool)
+    scored: list[tuple[float, str]] = []
+    for symbol in pool:
+        volume = store.latest_daily_quote_volume(symbol)
+        scored.append((0.0 if volume is None else float(volume), symbol))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    liquid = [symbol for _volume, symbol in scored[:top_n]]
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        if symbol in pool_set and symbol not in liquid:
+            liquid.append(symbol)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for symbol in [*held, *liquid]:
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        ordered.append(symbol)
+    return ordered
+
+
+def note_books_decided(store, settings: dict, now_ms: int) -> None:
+    """The window was open and the books were evaluated. Do not skip it later."""
+    day = decision_bar_open(now_ms)
+    for spec in enabled_specs(settings):
+        if not _decision_due(spec, day):
+            continue
+        _set_settled(store, spec["book"], day, "decided", now_ms)
+
+
+def settle_stale_books(store, settings: dict, now_ms: int, journal: DecisionJournal) -> list[str]:
+    """One skip per book when the deadline passed and that close was never evaluated."""
+    timeout_ms = int(settings["decision"]["timeout_seconds"]) * 1000
+    if book_window_open(now_ms, timeout_ms):
+        return []
+    day = decision_bar_open(now_ms)
+    opened = day + DAY_MS
+    if int(now_ms) < opened + timeout_ms:
+        return []
+    skipped: list[str] = []
+    for spec in enabled_specs(settings):
+        if not _decision_due(spec, day):
+            continue
+        meta = _meta(store, spec["book"])
+        settled = dict(meta.get("settled") or {})
+        key = str(day)
+        if key in settled:
+            continue
+        signal_id = f"{spec['book']}-stale-{day}"
+        journal.record_event(
+            int(now_ms),
+            signal_id,
+            "skip",
+            {
+                "book": spec["book"],
+                "reason": "stale_data",
+                "decision_day_ms": day,
+                "detail": "daily bars were still stale at the decision deadline",
+            },
+        )
+        settled[key] = "stale_skip"
+        meta["settled"] = settled
+        _save_meta(store, spec["book"], meta, now_ms)
+        skipped.append(signal_id)
+    return skipped
+
+
+def _set_settled(store, book: str, day_open_ms: int, outcome: str, now_ms: int) -> None:
+    meta = _meta(store, book)
+    settled = dict(meta.get("settled") or {})
+    key = str(int(day_open_ms))
+    if settled.get(key) == outcome:
+        return
+    settled[key] = outcome
+    meta["settled"] = settled
+    _save_meta(store, book, meta, now_ms)
 
 
 def diff_book(current: dict[str, Leg], target: dict[str, Leg]) -> dict[str, list[dict]]:
@@ -848,7 +968,7 @@ def _maybe_rebalance(store, settings, spec, features, decision_i, now_ms, journa
         return None
     ts = day + DAY_MS
     timeout_ms = int(settings["decision"]["timeout_seconds"]) * 1000
-    if int(now_ms) - ts > timeout_ms:
+    if int(now_ms) - ts >= timeout_ms:
         return None
     packet = _build_packet(
         settings,
@@ -880,7 +1000,7 @@ def _maybe_entries(store, settings, spec, features, decision_i, now_ms, journal,
     day = int(features.day_ms[decision_i])
     ts = day + DAY_MS
     timeout_ms = int(settings["decision"]["timeout_seconds"]) * 1000
-    if int(now_ms) - ts > timeout_ms:
+    if int(now_ms) - ts >= timeout_ms:
         return []
     meta = _meta(store, spec["book"])
     suspend = {symbol: int(side) for symbol, side in (meta.get("suspend") or {}).items()}

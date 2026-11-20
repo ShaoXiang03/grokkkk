@@ -200,6 +200,7 @@ class PaperRefresh:
         started = time.monotonic()
         opens = store.latest_opens("1d")
         self._held = _held_symbols(store)
+        self._refresh_priority(store, symbols, opens, now_ms, summary, started, max_wall_ms, max_vision_files)
         idle = 0
         steps = 0
         limit = max(len(symbols) * (TAIL_DAYS + 4), max_vision_files) + len(symbols)
@@ -239,6 +240,59 @@ class PaperRefresh:
                 summary["pause_reason"] = reason
         self._emit(summary)
         return summary
+
+    def _refresh_priority(
+        self,
+        store,
+        symbols: list[str],
+        opens: dict[str, int],
+        now_ms: int,
+        summary: dict,
+        started: float,
+        max_wall_ms: int,
+        max_vision_files: int,
+    ) -> None:
+        """Catch the book universe and held coins up before the round-robin tail.
+
+        Each priority name is walked until its just-closed daily bar is stored,
+        or until vision/fapi cannot continue. The weight pause is unchanged:
+        a paused fapi call stops that name and still lets vision run for the next.
+        """
+        try:
+            from desk.paper.books import book_priority_symbols
+
+            wanted = book_priority_symbols(store, self.settings, symbols)
+        except Exception:
+            logging.exception("paper refresh could not rank the book universe")
+            wanted = sorted(self._held)
+        seen: set[str] = set()
+        ordered: list[str] = []
+        allowed = set(symbols)
+        for symbol in [*sorted(self._held), *wanted]:
+            if not symbol or symbol in seen or symbol not in allowed:
+                continue
+            seen.add(symbol)
+            ordered.append(symbol)
+        target = last_closed_daily_open(now_ms)
+        for symbol in ordered:
+            if summary["vision_files"] >= max_vision_files:
+                return
+            if (time.monotonic() - started) * 1000 >= max_wall_ms:
+                return
+            while int(opens.get(symbol) or -1) < target:
+                if summary["vision_files"] >= max_vision_files:
+                    return
+                if (time.monotonic() - started) * 1000 >= max_wall_ms:
+                    return
+                try:
+                    outcome = self._step(store, symbol, opens, now_ms, summary)
+                except Exception:
+                    logging.exception("paper refresh step failed for %s", symbol)
+                    summary["errors"] += 1
+                    self._retry_after[("err", symbol)] = int(now_ms) + VISION_ERROR_RETRY_MS
+                    break
+                if outcome in ("skip", "done", "paused", "error", "vision_miss"):
+                    break
 
     def _pending(self, opens: dict[str, int], symbols: list[str], now_ms: int) -> int:
         target = last_closed_daily_open(now_ms)

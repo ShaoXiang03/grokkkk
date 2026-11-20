@@ -576,3 +576,58 @@ def test_drift_alert_is_journalled_once_when_paper_leaves_the_band(tmp_path):
     assert len(events) == 1
     assert "e2 turnover" in events[0]["payload"]["alerts"]
     store.close()
+
+
+def _daily_names(alts):
+    return ["BTCUSDT", *alts, "ZZZUSDT"]
+
+
+def test_stale_open_still_decides_once_the_daily_bars_are_fresh(tmp_path):
+    """08:00 MYT is stale while the archive catches up. The same close still decides before 09:00."""
+    day_ms = _days(80)
+    settings = _settings(tmp_path)
+    settings["strategies"]["e2_residual_momentum"]["enabled"] = False
+    settings["account"]["news_status"] = None
+    settings["decision"]["timeout_seconds"] = 3600
+    store = Store(tmp_path / "desk.sqlite")
+    alts = _panel(store, day_ms[:-1])
+    names = _daily_names(alts)
+    close_ms = int(day_ms[-1] + DAY_MS)
+    stale_now = close_ms + 5 * 60_000
+    first = run_cycle(settings, store, now_ms=stale_now, symbols=names)
+    assert first["block"] == "stale_data"
+    assert first["books"]["proposed"] == []
+    assert first["books"]["skipped"] == []
+    _panel(store, day_ms[-1:])
+    second = run_cycle(settings, store, now_ms=stale_now + 3 * 60_000, symbols=names)
+    assert second["block"] is None
+    assert second["books"]["proposed"]
+    assert second["books"]["skipped"] == []
+    packet = store.get_signal(second["books"]["proposed"][0])
+    assert packet["hard_gates"]["news"]["result"] == "fail"
+    assert packet["decision_day_ms"] == int(day_ms[-1])
+    store.close()
+
+
+def test_stale_book_is_skipped_at_the_deadline_and_not_replayed(tmp_path):
+    day_ms = _days(80)
+    settings = _settings(tmp_path)
+    settings["strategies"]["e2_residual_momentum"]["enabled"] = False
+    settings["account"]["news_status"] = None
+    settings["decision"]["timeout_seconds"] = 3600
+    store = Store(tmp_path / "desk.sqlite")
+    alts = _panel(store, day_ms[:-1])
+    names = _daily_names(alts)
+    deadline = int(day_ms[-1] + DAY_MS + 3600 * 1000)
+    late = run_cycle(settings, store, now_ms=deadline, symbols=names)
+    assert late["books"]["proposed"] == []
+    assert late["books"]["skipped"]
+    assert late["block"] == "stale_data"
+    skip = store.read_decision_journal(late["books"]["skipped"][0])
+    assert skip[-1]["event"] == "skip"
+    assert skip[-1]["payload"]["reason"] == "stale_data"
+    _panel(store, day_ms[-1:])
+    after = run_cycle(settings, store, now_ms=deadline + 60_000, symbols=names)
+    assert after["books"]["proposed"] == []
+    assert after["books"]["skipped"] == []
+    store.close()

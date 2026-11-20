@@ -26,9 +26,18 @@ from desk.delivery.eligibility import entry_blocks, expire_pending
 from desk.delivery.outbox import drain_outbox
 from desk.indicators.core import add_indicators, ema_column
 from desk.journal.decision import DecisionJournal
-from desk.paper.books import book_contribution, fill_books, propose_books, reduce_books
+from desk.paper.books import (
+    book_contribution,
+    book_priority_symbols,
+    book_window_open,
+    fill_books,
+    note_books_decided,
+    propose_books,
+    reduce_books,
+    settle_stale_books,
+)
 from desk.paper.clock import myt_week_key
-from desk.paper.freshness import daily_only, data_is_fresh, setups_enabled
+from desk.paper.freshness import daily_books_enabled, daily_only, data_is_fresh, setups_enabled
 from desk.paper.scorecard import build_scorecard, note_drift
 from desk.paper.state import dump_position, load_position
 from desk.rules.risk_gates import _as_float
@@ -412,7 +421,14 @@ def run_cycle(
         for trade in closed:
             _journal_exit(journal, trade, now_ms)
         book_closed = reduce_books(settings, store, now_ms, journal, kill=None)
-        fresh, fresh_reason = data_is_fresh(store, chosen, now_ms, settings)
+        gate_symbols = chosen
+        if daily_only(settings):
+            # The morning decision needs the book universe, not all ~820 archived names.
+            priority = book_priority_symbols(store, settings, chosen)
+            if priority:
+                gate_symbols = priority
+        fresh, fresh_reason = data_is_fresh(store, gate_symbols, now_ms, settings)
+        skipped_books = settle_stale_books(store, settings, now_ms, journal)
         kill = kill_switch_reason(settings)
         flattened: list[dict] = []
         if kill and fresh:
@@ -463,7 +479,12 @@ def run_cycle(
                     onchain_raw=onchain_raw,
                 )
             snapshot = marked_equity(store, settings, now_ms) or snapshot
-            proposed = propose_books(settings, store, now_ms, journal, snapshot)
+            timeout_ms = int(settings["decision"]["timeout_seconds"]) * 1000
+            books_due = (not daily_books_enabled(settings)) or book_window_open(now_ms, timeout_ms)
+            if books_due:
+                proposed = propose_books(settings, store, now_ms, journal, snapshot)
+                if daily_books_enabled(settings) and book_window_open(now_ms, timeout_ms):
+                    note_books_decided(store, settings, now_ms)
             snapshot = marked_equity(store, settings, now_ms) or snapshot
             filled = fill_pending(store, settings, now_ms, snapshot, journal)
             snapshot = marked_equity(store, settings, now_ms) or snapshot
@@ -499,6 +520,7 @@ def run_cycle(
                 "proposed": [packet["signal_id"] for packet in proposed],
                 "filled": [row["signal_id"] for row in book_filled],
                 "exited": [trade["signal_id"] for trade in book_closed],
+                "skipped": skipped_books,
             },
             "scorecard": scorecard,
         }
