@@ -169,10 +169,8 @@ def book_priority_symbols(store, settings: dict, universe: list[str] | None = No
         held.append(str(row["symbol"]))
     pool = list(universe) if universe is not None else store.symbols_with_interval("1d")
     pool_set = set(pool)
-    scored: list[tuple[float, str]] = []
-    for symbol in pool:
-        volume = store.latest_daily_quote_volume(symbol)
-        scored.append((0.0 if volume is None else float(volume), symbol))
+    volumes = store.latest_daily_quote_volumes(pool)
+    scored = [(volumes.get(symbol, 0.0), symbol) for symbol in pool]
     scored.sort(key=lambda item: (-item[0], item[1]))
     liquid = [symbol for _volume, symbol in scored[:top_n]]
     for symbol in ("BTCUSDT", "ETHUSDT"):

@@ -5,9 +5,81 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pandas as pd
+
+
+class _BufferedCursor:
+    """Rows already read off the connection, so another thread can use it."""
+
+    def __init__(self, rows: list, lastrowid: int | None):
+        self._rows = rows
+        self._index = 0
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return row
+
+    def fetchall(self) -> list:
+        rows = self._rows[self._index :]
+        self._index = len(self._rows)
+        return rows
+
+    def __iter__(self):
+        while self._index < len(self._rows):
+            row = self._rows[self._index]
+            self._index += 1
+            yield row
+
+
+class _SerializedConnection:
+    """One sqlite connection, usable from the refresh thread and the cycle.
+
+    ``check_same_thread=False`` only disables the thread check. Two threads
+    inside ``execute`` at once raise InterfaceError. Every call takes the
+    store lock and finishes the cursor before releasing it.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+        self._conn = conn
+        self._lock = lock
+
+    def execute(self, sql: str, parameters=()):
+        with self._lock:
+            cursor = self._conn.execute(sql, parameters)
+            try:
+                rows = cursor.fetchall()
+                lastrowid = cursor.lastrowid
+            finally:
+                cursor.close()
+        return _BufferedCursor(rows, lastrowid)
+
+    def executemany(self, sql: str, seq):
+        with self._lock:
+            cursor = self._conn.executemany(sql, seq)
+            try:
+                lastrowid = cursor.lastrowid
+            finally:
+                cursor.close()
+        return _BufferedCursor([], lastrowid)
+
+    def executescript(self, sql: str):
+        with self._lock:
+            self._conn.executescript(sql)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
 
 SCHEMA = """
@@ -213,9 +285,13 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        # The refresh thread and the paper cycle share this connection.
+        self.conn = _SerializedConnection(self._conn, self.lock)
+        # One quote-volume snapshot. Replaced, never appended to.
+        self._daily_quote_cache: tuple[float, tuple[str, ...], dict[str, float]] | None = None
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
@@ -224,6 +300,11 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    def _frame(self, sql: str, params=None) -> pd.DataFrame:
+        """pandas reads the raw connection. Hold the same lock around that read."""
+        with self.lock:
+            return pd.read_sql_query(sql, self._conn, params=params)
 
     def _ensure_funding_interval(self) -> None:
         columns = [row[1] for row in self.conn.execute("PRAGMA table_info(funding)")]
@@ -340,17 +421,40 @@ class Store:
 
     def latest_daily_quote_volume(self, symbol: str) -> float | None:
         """Last stored daily quote volume. Uses the (symbol, interval, open_time) key."""
-        row = self.conn.execute(
-            """
-            SELECT quote_volume FROM klines
-            WHERE symbol = ? AND interval = '1d'
-            ORDER BY open_time DESC LIMIT 1
-            """,
-            (symbol,),
-        ).fetchone()
-        if row is None or row["quote_volume"] is None:
-            return None
-        return float(row["quote_volume"])
+        found = self.latest_daily_quote_volumes([symbol])
+        return found.get(symbol)
+
+    def latest_daily_quote_volumes(self, symbols: list[str]) -> dict[str, float]:
+        """Last daily quote volume for each name, under one lock.
+
+        The result is reused for a minute. The refresh thread and the cycle
+        both ask for the same ranking, and repeating one query per symbol
+        on every slice was the overlap that tripped sqlite.
+        """
+        key = tuple(symbols)
+        now = time.monotonic()
+        with self.lock:
+            cached = self._daily_quote_cache
+            if cached is not None and now - cached[0] < 60 and cached[1] == key:
+                return cached[2]
+            found: dict[str, float] = {}
+            for symbol in symbols:
+                cursor = self._conn.execute(
+                    """
+                    SELECT quote_volume FROM klines
+                    WHERE symbol = ? AND interval = '1d'
+                    ORDER BY open_time DESC LIMIT 1
+                    """,
+                    (symbol,),
+                )
+                try:
+                    row = cursor.fetchone()
+                finally:
+                    cursor.close()
+                if row is not None and row["quote_volume"] is not None:
+                    found[symbol] = float(row["quote_volume"])
+            self._daily_quote_cache = (now, key, found)
+            return found
 
     def latest_open_time(self, symbol: str, interval: str) -> int | None:
         row = self.conn.execute(
@@ -371,8 +475,7 @@ class Store:
             sql += " AND close_time <= ?"
             params.append(int(end_ms))
         sql += " ORDER BY open_time"
-        frame = pd.read_sql_query(sql, self.conn, params=params)
-        return frame
+        return self._frame(sql, params)
 
     def upsert_funding(self, symbol: str, rows: list[dict]) -> None:
         self.conn.executemany(
@@ -404,10 +507,9 @@ class Store:
         return int(row["t"])
 
     def funding(self, symbol: str) -> pd.DataFrame:
-        return pd.read_sql_query(
+        return self._frame(
             "SELECT funding_time, funding_rate FROM funding WHERE symbol = ? ORDER BY funding_time",
-            self.conn,
-            params=[symbol],
+            [symbol],
         )
 
     def save_funding_snapshot(self, symbol: str, ts_ms: int, predicted_rate: float | None, next_funding_time: int | None) -> None:
@@ -620,28 +722,23 @@ class Store:
         return [dict(row) for row in rows]
 
     def load_interval_frame(self, interval: str) -> pd.DataFrame:
-        return pd.read_sql_query(
+        return self._frame(
             """
             SELECT symbol, open_time, open, high, low, close, quote_volume
             FROM klines WHERE interval = ?
             """,
-            self.conn,
-            params=[interval],
+            [interval],
         )
 
     def load_funding_frame(self) -> pd.DataFrame:
-        return pd.read_sql_query(
-            "SELECT symbol, funding_time, funding_rate, interval_hours FROM funding",
-            self.conn,
-        )
+        return self._frame("SELECT symbol, funding_time, funding_rate, interval_hours FROM funding")
 
     def load_metrics_frame(self) -> pd.DataFrame:
-        return pd.read_sql_query(
+        return self._frame(
             """
             SELECT symbol, day_ms, create_time, sum_open_interest, sum_open_interest_value
             FROM metrics_daily
-            """,
-            self.conn,
+            """
         )
 
     def upsert_metrics_daily(self, rows: list[dict]) -> None:
